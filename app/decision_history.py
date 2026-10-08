@@ -9,34 +9,119 @@ DECISIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 def player_snapshot(player):
     """
-    Store only the information we care about for evaluating
-    a decision later.
+    Store the information the model knew when the
+    decision was made.
     """
 
     return {
         "espn_id": player.get("espn_id"),
-        "fantasypros_id": player.get("fantasypros_id"),
+        "fantasypros_id": player.get(
+            "fantasypros_id"
+        ),
 
         "name": player.get("name"),
         "position": player.get("position"),
         "nfl_team": player.get("nfl_team"),
 
-        "injury_status": player.get("injury_status"),
-        "lineup_slot": player.get("lineup_slot"),
+        "injury_status": player.get(
+            "injury_status"
+        ),
+        "lineup_slot": player.get(
+            "lineup_slot"
+        ),
 
-        # Weekly FantasyPros data
-        "projection_ppr": player.get("fp_ppr"),
-        "ecr": player.get("ecr"),
-        "pos_rank": player.get("pos_rank"),
-        "rank_min": player.get("rank_min"),
-        "rank_max": player.get("rank_max"),
-        "rank_std": player.get("rank_std"),
-        "opponent": player.get("opponent"),
+        # ----------------------------------------------
+        # Weekly value
+        # ----------------------------------------------
 
-        # Recent actual NFL usage
-        "recent_usage": player.get("recent_usage"),
+        "projection_ppr": player.get(
+            "fp_ppr"
+        ),
+
+        "weekly_ecr": player.get(
+            "ecr"
+        ),
+
+        "weekly_pos_rank": player.get(
+            "pos_rank"
+        ),
+
+        "weekly_score": player.get(
+            "weekly_score"
+        ),
+
+        "rank_min": player.get(
+            "rank_min"
+        ),
+
+        "rank_max": player.get(
+            "rank_max"
+        ),
+
+        "rank_std": player.get(
+            "rank_std"
+        ),
+
+        "opponent": player.get(
+            "opponent"
+        ),
+
+        # ----------------------------------------------
+        # Rest-of-season value
+        # ----------------------------------------------
+
+        "ros_ecr": player.get(
+            "ros_ecr"
+        ),
+
+        "ros_pos_rank": player.get(
+            "ros_pos_rank"
+        ),
+
+        "ros_score": player.get(
+            "ros_score"
+        ),
+
+        "ros_min": player.get(
+            "ros_min"
+        ),
+
+        "ros_max": player.get(
+            "ros_max"
+        ),
+
+        "ros_std": player.get(
+            "ros_std"
+        ),
+
+        # ----------------------------------------------
+        # Recent NFL performance / opportunity
+        # ----------------------------------------------
+
+        "recent_usage": player.get(
+            "recent_usage"
+        ),
+
+        "weekly_data_complete": player.get(
+            "weekly_data_complete"
+        ),
+
+        "weekly_missing_data": player.get(
+            "weekly_missing_data"
+        ),
+
+        "ros_data_complete": player.get(
+            "ros_data_complete"
+        ),
+
+        "ros_missing_data": player.get(
+            "ros_missing_data"
+        ),
+
+        "availability": player.get(
+            "availability"
+        ),
     }
-
 
 def save_weekly_snapshot(
     season,

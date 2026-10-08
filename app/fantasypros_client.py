@@ -27,7 +27,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL = timedelta(hours=3)
 
 # FantasyPros rate limit protection
-MIN_REQUEST_INTERVAL = 1.1
+MIN_REQUEST_INTERVAL = 2.0
 
 _last_request_time = 0.0
 
