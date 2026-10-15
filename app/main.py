@@ -2,16 +2,20 @@ from espn_client import (
     get_league,
     get_my_team,
     get_roster,
-    get_free_agents
+    get_free_agents,
 )
 
 from player_enrichment import (
     enrich_players,
-    add_specific_rankings
+    add_specific_rankings,
 )
 
 from lineup_optimizer import (
     optimize_lineup,
+)
+from waiver_advisor import (
+    evaluate_all_transactions,
+    rank_transactions,
 )
 
 from decision_history import (
@@ -30,7 +34,13 @@ from week_status import (
 SEASON = 2026
 
 
-def print_roster(roster):
+# ==================================================
+# Roster display
+# ==================================================
+
+def print_roster(
+    roster,
+):
     """
     Print the enriched roster.
     """
@@ -54,11 +64,12 @@ def print_roster(roster):
 
     for player in roster:
 
+        # ------------------------------------------
         # Weekly projection
-        projection = (
-            player.get(
-                "fp_ppr"
-            )
+        # ------------------------------------------
+
+        projection = player.get(
+            "fp_ppr"
         )
 
         proj_text = (
@@ -67,10 +78,15 @@ def print_roster(roster):
             else "N/A"
         )
 
+        # ------------------------------------------
         # Weekly ECR
+        # ------------------------------------------
+
         weekly_rank = (
             str(
-                player["pos_rank"]
+                player[
+                    "pos_rank"
+                ]
             )
             if player.get(
                 "pos_rank"
@@ -78,7 +94,10 @@ def print_roster(roster):
             else "N/A"
         )
 
+        # ------------------------------------------
         # ROS ECR
+        # ------------------------------------------
+
         ros_rank = (
             str(
                 player[
@@ -91,11 +110,12 @@ def print_roster(roster):
             else "N/A"
         )
 
-        # Weekly score
-        weekly_score = (
-            player.get(
-                "weekly_score"
-            )
+        # ------------------------------------------
+        # Weekly value
+        # ------------------------------------------
+
+        weekly_score = player.get(
+            "weekly_score"
         )
 
         weekly_value = (
@@ -104,11 +124,12 @@ def print_roster(roster):
             else "N/A"
         )
 
-        # ROS score
-        ros_score = (
-            player.get(
-                "ros_score"
-            )
+        # ------------------------------------------
+        # ROS value
+        # ------------------------------------------
+
+        ros_score = player.get(
+            "ros_score"
         )
 
         ros_value = (
@@ -117,7 +138,10 @@ def print_roster(roster):
             else "N/A"
         )
 
-        # Recent PPR
+        # ------------------------------------------
+        # Recent PPR production
+        # ------------------------------------------
+
         usage = player.get(
             "recent_usage"
         )
@@ -137,12 +161,20 @@ def print_roster(roster):
 
             recent_ppr = "N/A"
 
+        # ------------------------------------------
+        # Opponent
+        # ------------------------------------------
+
         opponent = (
             player.get(
                 "opponent"
             )
             or "N/A"
         )
+
+        # ------------------------------------------
+        # Injury status
+        # ------------------------------------------
 
         status = (
             player.get(
@@ -165,14 +197,24 @@ def print_roster(roster):
         )
 
 
-def print_unmapped_players(roster):
+# ==================================================
+# Unmapped FantasyPros players
+# ==================================================
+
+def print_unmapped_players(
+    roster,
+):
     """
     Show ESPN players that could not be mapped to
     FantasyPros.
+
+    Note:
+    A player can still have an ESPN projection even if
+    they are unmapped to FantasyPros.
     """
 
     print(
-        "\n=== UNMAPPED PLAYERS ==="
+        "\n=== UNMAPPED FANTASYPROS PLAYERS ==="
     )
 
     unmapped = [
@@ -185,7 +227,9 @@ def print_unmapped_players(roster):
 
     if not unmapped:
 
-        print("None")
+        print(
+            "None"
+        )
 
         return
 
@@ -197,6 +241,10 @@ def print_unmapped_players(roster):
             player["position"],
         )
 
+
+# ==================================================
+# Optimal lineup display
+# ==================================================
 
 def print_optimal_lineup(
     optimized,
@@ -222,9 +270,10 @@ def print_optimal_lineup(
 
         return
 
-    for slot, player in (
-        lineup.items()
-    ):
+    for (
+        slot,
+        player,
+    ) in lineup.items():
 
         if player is None:
 
@@ -283,6 +332,11 @@ def print_optimal_lineup(
         f"{optimized['lineup_score']:.2f}"
     )
 
+
+# ==================================================
+# Waiver prescreen
+# ==================================================
+
 def get_waiver_prescreen_score(
     player,
 ):
@@ -302,7 +356,6 @@ def get_waiver_prescreen_score(
 
     # ----------------------------------------------
     # Weekly value
-    # Already on roughly a 0-100 scale.
     # ----------------------------------------------
 
     weekly_score = (
@@ -314,7 +367,8 @@ def get_waiver_prescreen_score(
 
     weekly_component = min(
         max(
-            weekly_score / 100.0,
+            weekly_score
+            / 100.0,
             0.0,
         ),
         1.0,
@@ -328,15 +382,18 @@ def get_waiver_prescreen_score(
         player
         .get(
             "signals",
-            {}
+            {},
         )
         .get(
             "leaguelogs",
-            {}
+            {},
         )
     )
 
-    # Market value is already 0 -> 10,000.
+    # ----------------------------------------------
+    # Market value
+    # ----------------------------------------------
+
     market_value = (
         leaguelogs.get(
             "market_value"
@@ -344,12 +401,15 @@ def get_waiver_prescreen_score(
     )
 
     if market_value is None:
+
         market_component = 0.0
 
     else:
+
         market_component = min(
             max(
-                market_value / 10000.0,
+                market_value
+                / 10000.0,
                 0.0,
             ),
             1.0,
@@ -357,9 +417,6 @@ def get_waiver_prescreen_score(
 
     # ----------------------------------------------
     # LeagueLogs ROS positional rank
-    #
-    # Same rank normalization concept we use in
-    # player_value.py.
     # ----------------------------------------------
 
     ros_pos_rank = (
@@ -372,34 +429,48 @@ def get_waiver_prescreen_score(
         ros_pos_rank is None
         or ros_pos_rank <= 0
     ):
+
         ros_component = 0.0
 
     else:
+
         ros_component = (
             1.0
             / (
                 1.0
                 + 0.1
                 * (
-                    ros_pos_rank - 1
+                    ros_pos_rank
+                    - 1
                 )
             )
         )
 
     # ----------------------------------------------
-    # Final prescreen
+    # Final prescreen score
     # ----------------------------------------------
 
     score = (
-        weekly_component * 0.50
-        + market_component * 0.30
-        + ros_component * 0.20
+        weekly_component
+        * 0.50
+
+        + market_component
+        * 0.30
+
+        + ros_component
+        * 0.20
     )
 
     return round(
-        score * 100.0,
+        score
+        * 100.0,
         2,
     )
+
+
+# ==================================================
+# Waiver shortlist
+# ==================================================
 
 def get_top_waiver_candidates(
     free_agents,
@@ -412,12 +483,12 @@ def get_top_waiver_candidates(
 
     The shortlist considers:
 
-        - immediate weekly usefulness
-        - LeagueLogs market value
-        - LeagueLogs rest-of-season rank
+        immediate weekly usefulness
+        LeagueLogs market value
+        LeagueLogs rest-of-season rank
 
-    This helps us catch both weekly streamers and
-    valuable long-term pickups.
+    This helps catch both weekly streamers and valuable
+    long-term pickups.
     """
 
     candidates = []
@@ -432,18 +503,17 @@ def get_top_waiver_candidates(
         position_players = [
             player
             for player in free_agents
-            if player["position"]
-            == position
+            if player.get(
+                "position"
+            ) == position
         ]
 
         for player in position_players:
 
             player[
                 "waiver_prescreen_score"
-            ] = (
-                get_waiver_prescreen_score(
-                    player
-                )
+            ] = get_waiver_prescreen_score(
+                player
             )
 
         position_players.sort(
@@ -465,9 +535,17 @@ def get_top_waiver_candidates(
     return candidates
 
 
+# ==================================================
+# Waiver display
+# ==================================================
+
 def print_waiver_candidates(
     players,
 ):
+    """
+    Print the shortlisted waiver candidates.
+    """
+
     print(
         "\n=== TOP WAIVER CANDIDATES ==="
     )
@@ -496,7 +574,9 @@ def print_waiver_candidates(
         players,
         key=lambda player: (
             position_order.get(
-                player["position"],
+                player.get(
+                    "position"
+                ),
                 99,
             ),
             -(
@@ -510,6 +590,10 @@ def print_waiver_candidates(
 
     for player in players:
 
+        # ------------------------------------------
+        # Projection
+        # ------------------------------------------
+
         projection = player.get(
             "fp_ppr"
         )
@@ -520,22 +604,41 @@ def print_waiver_candidates(
             else "N/A"
         )
 
+        # ------------------------------------------
+        # Weekly rank
+        # ------------------------------------------
+
         weekly_rank = (
-            str(player["pos_rank"])
-            if player.get("pos_rank")
-            is not None
+            str(
+                player[
+                    "pos_rank"
+                ]
+            )
+            if player.get(
+                "pos_rank"
+            ) is not None
             else "N/A"
         )
 
+        # ------------------------------------------
+        # ROS rank
+        # ------------------------------------------
+
         ros_rank = (
             str(
-                player["ros_pos_rank"]
+                player[
+                    "ros_pos_rank"
+                ]
             )
             if player.get(
                 "ros_pos_rank"
             ) is not None
             else "N/A"
         )
+
+        # ------------------------------------------
+        # Weekly value
+        # ------------------------------------------
 
         weekly_score = (
             player.get(
@@ -549,6 +652,10 @@ def print_waiver_candidates(
             else "N/A"
         )
 
+        # ------------------------------------------
+        # ROS value
+        # ------------------------------------------
+
         ros_score = player.get(
             "ros_score"
         )
@@ -559,6 +666,10 @@ def print_waiver_candidates(
             else "N/A"
         )
 
+        # ------------------------------------------
+        # Data completeness
+        # ------------------------------------------
+
         weekly_complete = player.get(
             "weekly_data_complete"
         )
@@ -567,32 +678,45 @@ def print_waiver_candidates(
             "ros_data_complete"
         )
 
-
         if weekly_complete is True:
+
             weekly_data_text = "FULL"
 
         elif weekly_complete is False:
+
             weekly_data_text = "PARTIAL"
 
         else:
+
             weekly_data_text = "N/A"
 
-
         if ros_complete is True:
+
             ros_data_text = "FULL"
 
         elif ros_complete is False:
+
             ros_data_text = "PARTIAL"
 
         else:
+
             ros_data_text = "N/A"
 
-        usage = player.get(
-            "recent_usage"
-        ) or {}
+        # ------------------------------------------
+        # Recent production
+        # ------------------------------------------
 
-        recent_ppr = usage.get(
-            "ppr_points_per_game"
+        usage = (
+            player.get(
+                "recent_usage"
+            )
+            or {}
+        )
+
+        recent_ppr = (
+            usage.get(
+                "ppr_points_per_game"
+            )
         )
 
         recent_text = (
@@ -614,30 +738,322 @@ def print_waiver_candidates(
             f"{recent_text:>8}"
         )
 
+def print_waiver_advice(
+    ranked_transactions,
+    limit=10,
+):
+    """
+    Print the best waiver add/drop recommendations.
+
+    Only the best transaction for each potential add
+    is displayed so the output does not contain many
+    duplicate recommendations for the same player.
+    """
+
+    print(
+        "\n=== WAIVER ADVISOR ==="
+    )
+
+    if not ranked_transactions:
+
+        print(
+            "No valid waiver transactions found."
+        )
+
+        return
+
+    # --------------------------------------------------
+    # Keep only the best transaction for each player
+    # we might add.
+    #
+    # rank_transactions() already puts the strongest
+    # version of each move first.
+    # --------------------------------------------------
+
+    best_by_add = []
+
+    seen_adds = set()
+    actionable_categories = {
+        "STRONG_ADD",
+        "ADD",
+        "STASH",
+        "STREAMER",
+    }
+
+    for result in ranked_transactions:
+        if result.get(
+            "recommendation"
+        ) not in actionable_categories:
+            continue
+
+        add_player = result.get(
+            "add",
+            {},
+        )
+
+        add_key = (
+            add_player.get(
+                "espn_id"
+            )
+            or (
+                add_player.get(
+                    "name"
+                ),
+                add_player.get(
+                    "position"
+                ),
+            )
+        )
+
+        if add_key in seen_adds:
+            continue
+
+        seen_adds.add(
+            add_key
+        )
+
+        best_by_add.append(
+            result
+        )
+
+        if len(
+            best_by_add
+        ) >= limit:
+            break
+        
+    if not best_by_add:
+
+        print(
+            "No waiver moves currently clear "
+            "the threshold for an add."
+        )
+
+        return
+
+    # --------------------------------------------------
+    # Print each recommendation
+    # --------------------------------------------------
+
+    for index, result in enumerate(
+        best_by_add,
+        start=1,
+    ):
+
+        add_player = result.get(
+            "add",
+            {},
+        )
+
+        drop_player = result.get(
+            "drop",
+            {},
+        )
+
+        category = result.get(
+            "recommendation",
+            "N/A",
+        )
+
+        reason = result.get(
+            "recommendation_reason",
+            "",
+        )
+
+        weekly_delta = result.get(
+            "weekly_lineup_delta"
+        )
+
+        projected_delta = result.get(
+            "projected_points_delta"
+        )
+
+        ros_delta = result.get(
+            "ros_delta"
+        )
+
+        market_delta = result.get(
+            "market_value_delta"
+        )
+
+        balance_delta = result.get(
+            "roster_balance_delta"
+        )
+
+        depth_risk = result.get(
+            "depth_risk",
+            False,
+        )
+
+        depth_risks = (
+            result.get(
+                "depth_risks"
+            )
+            or []
+        )
+
+        # ----------------------------------------------
+        # Formatting
+        # ----------------------------------------------
+
+        weekly_text = (
+            f"{weekly_delta:+.2f}"
+            if weekly_delta is not None
+            else "N/A"
+        )
+
+        projected_text = (
+            f"{projected_delta:+.2f}"
+            if projected_delta is not None
+            else "N/A"
+        )
+
+        ros_text = (
+            f"{ros_delta:+.1f}"
+            if ros_delta is not None
+            else "N/A"
+        )
+
+        market_text = (
+            f"{market_delta:+.0f}"
+            if market_delta is not None
+            else "N/A"
+        )
+
+        balance_text = (
+            f"{balance_delta:+.1f}"
+            if balance_delta is not None
+            else "N/A"
+        )
+
+        # ----------------------------------------------
+        # Recommendation header
+        # ----------------------------------------------
+
+        print(
+            f"\n{index}. "
+            f"[{category}] "
+            f"ADD {add_player.get('name', 'N/A')} "
+            f"({add_player.get('position', 'N/A')})"
+        )
+
+        print(
+            f"   DROP "
+            f"{drop_player.get('name', 'N/A')} "
+            f"({drop_player.get('position', 'N/A')})"
+        )
+
+        # ----------------------------------------------
+        # Metrics
+        # ----------------------------------------------
+
+        print(
+            f"   Weekly lineup value: "
+            f"{weekly_text}"
+        )
+
+        print(
+            f"   Projected points:    "
+            f"{projected_text}"
+        )
+
+        print(
+            f"   ROS value:           "
+            f"{ros_text}"
+        )
+
+        print(
+            f"   Market value:        "
+            f"{market_text}"
+        )
+
+        print(
+            f"   Roster balance:      "
+            f"{balance_text}"
+        )
+
+        # ----------------------------------------------
+        # Depth warning
+        # ----------------------------------------------
+
+        if depth_risk:
+
+            if depth_risks:
+
+                print(
+                    "   WARNING: "
+                    + ", ".join(
+                        depth_risks
+                    )
+                )
+
+            else:
+
+                print(
+                    "   WARNING: "
+                    "Creates a roster-depth risk."
+                )
+
+        # ----------------------------------------------
+        # Explanation
+        # ----------------------------------------------
+
+        if reason:
+
+            print(
+                f"   Why: {reason}"
+            )
+
+    print(
+        "\nNote: K and D/ST waiver moves are "
+        "not evaluated by this model yet."
+    )
+
+# ==================================================
+# Main
+# ==================================================
+
 def main():
 
     # --------------------------------------------------
     # Evaluate completed historical weeks
+    #
+    # This is independent of the current ESPN roster.
     # --------------------------------------------------
 
     evaluate_pending_decisions()
 
     # --------------------------------------------------
-    # Load ESPN
+    # Load ESPN league
     # --------------------------------------------------
 
     league = get_league()
+
+    # IMPORTANT:
+    # Establish current week before fetching anything
+    # that needs a scoring period.
+    current_week = (
+        league.current_week
+    )
+
+    # --------------------------------------------------
+    # Get my ESPN team
+    # --------------------------------------------------
 
     my_team = get_my_team(
         league
     )
 
-    current_week = (
-        league.current_week
-    )
+    # --------------------------------------------------
+    # Get fresh ESPN roster
+    #
+    # Passing league + week lets espn_client attach
+    # ESPN weekly projections as a fallback.
+    # --------------------------------------------------
 
     roster = get_roster(
-        my_team
+        my_team,
+        league=league,
+        week=current_week,
     )
 
     # --------------------------------------------------
@@ -651,19 +1067,26 @@ def main():
     )
 
     # --------------------------------------------------
-    # Load ESPN free agents
+    # Get fresh ESPN free agents
+    #
+    # Passing the current week lets ESPN attach
+    # week-specific projected points.
     # --------------------------------------------------
 
     free_agents = get_free_agents(
         league,
         size=100,
+        week=current_week,
     )
 
     # --------------------------------------------------
     # First-pass free-agent enrichment
     #
-    # Batch projections/ECR and recent stats, but do NOT
-    # make individual FantasyPros ranking requests yet.
+    # Batch FantasyPros projections/ECR, nflverse stats,
+    # LeagueLogs, bye status, etc.
+    #
+    # Do NOT make an individual FantasyPros rankings
+    # request for all ~100 free agents.
     # --------------------------------------------------
 
     free_agents = enrich_players(
@@ -674,7 +1097,9 @@ def main():
     )
 
     # --------------------------------------------------
-    # Select the most relevant waiver candidates
+    # Select waiver shortlist
+    #
+    # Keep 5 per position.
     # --------------------------------------------------
 
     waiver_candidates = (
@@ -685,16 +1110,35 @@ def main():
     )
 
     # --------------------------------------------------
-    # Fully enrich only those candidates
+    # Fully enrich only shortlisted waiver candidates
     #
-    # Now we fetch ROS rankings and weekly fallbacks.
-    # At most ~20 offensive players instead of 100.
+    # This adds player-specific FantasyPros weekly
+    # fallback + ROS rankings.
     # --------------------------------------------------
 
-    waiver_candidates = add_specific_rankings(
-        players=waiver_candidates,
-        season=SEASON,
-        week=current_week,
+    waiver_candidates = (
+        add_specific_rankings(
+            players=waiver_candidates,
+            season=SEASON,
+            week=current_week,
+        )
+    )
+
+    # --------------------------------------------------
+    # Evaluate actual waiver add/drop combinations
+    # --------------------------------------------------
+
+    waiver_transactions = (
+        evaluate_all_transactions(
+            roster=roster,
+            waiver_candidates=waiver_candidates,
+        )
+    )
+
+    ranked_waiver_transactions = (
+        rank_transactions(
+            waiver_transactions
+        )
     )
 
     # --------------------------------------------------
@@ -719,9 +1163,22 @@ def main():
         roster
     )
 
+    # --------------------------------------------------
+    # Display waiver shortlist
+    # --------------------------------------------------
+
     print_waiver_candidates(
         waiver_candidates
     )
+
+    print_waiver_advice(
+        ranked_waiver_transactions,
+        limit=10,
+    )
+
+    # --------------------------------------------------
+    # Show players without FantasyPros mapping
+    # --------------------------------------------------
 
     print_unmapped_players(
         roster
@@ -807,6 +1264,10 @@ def main():
             f"status."
         )
 
+
+# ==================================================
+# Entry point
+# ==================================================
 
 if __name__ == "__main__":
     main()

@@ -10,6 +10,10 @@ def get_availability(player, current_week=None):
     Later, we will replace/augment this with real injury
     news and expected-return information.
     """
+    is_on_bye = player.get(
+        "is_on_bye",
+        False,
+    )
 
     status = (
         player.get("injury_status")
@@ -38,7 +42,19 @@ def get_availability(player, current_week=None):
             "ros_multiplier": 0.0,
             "reason": "Season-ending injury",
         }
+    
+    # --------------------------------------------------
+    # Bye week
+    # --------------------------------------------------
 
+    if is_on_bye:
+        return {
+            "can_play_this_week": False,
+            "weekly_multiplier": 0.0,
+            "ros_multiplier": 1.0,
+            "reason": "Bye week",
+        }
+    
     # --------------------------------------------------
     # Active / normal
     # --------------------------------------------------

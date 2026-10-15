@@ -1,20 +1,39 @@
 from collections import defaultdict
+import re
+import unicodedata
 
 from fantasypros_client import (
     get_projections_for_players,
+    get_position_projections,
     get_consensus_rankings,
     get_rankings_for_player,
 )
+
 from leaguelogs_client import (
     attach_leaguelogs_signals,
 )
 
-from player_ids import get_espn_to_fantasypros_map
-from nfl_data import get_recent_usage
-from player_value import add_player_values
+from nfl_data import (
+    get_recent_usage,
+    is_team_on_bye,
+)
+
+from player_ids import (
+    get_espn_to_fantasypros_map,
+)
+
+from player_value import (
+    add_player_values,
+)
 
 
-def normalize_fp_id(value):
+# ==================================================
+# FantasyPros ID helpers
+# ==================================================
+
+def normalize_fp_id(
+    value,
+):
     """
     Normalize FantasyPros IDs so ints, floats, and
     numeric strings all compare the same way.
@@ -24,14 +43,234 @@ def normalize_fp_id(value):
         return None
 
     try:
-        return int(float(value))
+        return int(
+            float(
+                value
+            )
+        )
 
     except (
         TypeError,
         ValueError,
     ):
-        return str(value).strip()
-    
+        return str(
+            value
+        ).strip()
+
+
+# ==================================================
+# Name / team matching helpers
+# ==================================================
+
+def normalize_player_name(
+    value,
+):
+    """
+    Normalize player names so ESPN and FantasyPros
+    names can be compared reliably.
+    """
+
+    if value is None:
+        return ""
+
+    name = unicodedata.normalize(
+        "NFKD",
+        str(value),
+    )
+
+    name = (
+        name
+        .encode(
+            "ascii",
+            "ignore",
+        )
+        .decode()
+    )
+
+    name = name.lower()
+
+    # Remove common suffixes.
+    name = re.sub(
+        r"\b(jr|sr|ii|iii|iv)\b\.?",
+        "",
+        name,
+    )
+
+    # Remove punctuation / normalize whitespace.
+    name = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        name,
+    )
+
+    return " ".join(
+        name.split()
+    )
+
+
+def normalize_team(
+    value,
+):
+    """
+    Normalize common NFL abbreviation differences
+    between data providers.
+    """
+
+    if value is None:
+        return None
+
+    team = str(
+        value
+    ).upper().strip()
+
+    aliases = {
+        # Rams
+        "LA": "LAR",
+        "LAR": "LAR",
+
+        # Commanders
+        "WAS": "WSH",
+        "WSH": "WSH",
+
+        # Jaguars
+        "JAC": "JAX",
+        "JAX": "JAX",
+
+        # Raiders
+        "OAK": "LV",
+        "LVR": "LV",
+        "LV": "LV",
+    }
+
+    return aliases.get(
+        team,
+        team,
+    )
+
+
+def _projection_name(
+    projection,
+):
+    """
+    FantasyPros has used slightly different field names
+    across endpoints. Handle common variants.
+    """
+
+    return (
+        projection.get(
+            "name"
+        )
+        or projection.get(
+            "player_name"
+        )
+        or projection.get(
+            "short_name"
+        )
+    )
+
+
+def _projection_team(
+    projection,
+):
+    """
+    Return normalized team abbreviation from a
+    FantasyPros projection row.
+    """
+
+    return normalize_team(
+        projection.get(
+            "team_id"
+        )
+        or projection.get(
+            "player_team_id"
+        )
+        or projection.get(
+            "team"
+        )
+    )
+
+
+def find_special_projection(
+    player,
+    projection_rows,
+):
+    """
+    Match ESPN K/DST players to FantasyPros full-position
+    projection rows.
+
+    K:
+        match by normalized player name
+
+    D/ST:
+        match by NFL team abbreviation
+    """
+
+    position = player.get(
+        "position"
+    )
+
+    # --------------------------------------------------
+    # Defense
+    # --------------------------------------------------
+
+    if position == "D/ST":
+
+        espn_team = normalize_team(
+            player.get(
+                "nfl_team"
+            )
+        )
+
+        if espn_team is None:
+            return None
+
+        for projection in projection_rows:
+
+            fp_team = _projection_team(
+                projection
+            )
+
+            if (
+                fp_team is not None
+                and fp_team == espn_team
+            ):
+                return projection
+
+        return None
+
+    # --------------------------------------------------
+    # Kicker
+    # --------------------------------------------------
+
+    if position == "K":
+
+        espn_name = normalize_player_name(
+            player.get(
+                "name"
+            )
+        )
+
+        for projection in projection_rows:
+
+            fp_name = normalize_player_name(
+                _projection_name(
+                    projection
+                )
+            )
+
+            if (
+                espn_name
+                and espn_name == fp_name
+            ):
+                return projection
+
+    return None
+
+
+# ==================================================
+# Main enrichment pipeline
+# ==================================================
+
 def enrich_players(
     players,
     season,
@@ -39,43 +278,51 @@ def enrich_players(
     include_player_specific=True,
 ):
     """
-    Take raw ESPN players and add:
+    Take raw ESPN players and attach:
 
-        fantasypros_id
-
-        weekly projections
-
+        FantasyPros ID
+        FantasyPros weekly projection
+        ESPN weekly projection fallback for K/DST
         weekly ECR
-
         rest-of-season ECR
-
         recent NFL usage
+        LeagueLogs signals
+        bye status
+        weekly score
+        ROS score
 
-        weekly_score
-
-        ros_score
-
-    The players list is updated in place and returned.
+    The list is modified in place and returned.
     """
 
     # --------------------------------------------------
-    # Map ESPN IDs -> FantasyPros IDs
+    # ESPN ID -> FantasyPros ID
     # --------------------------------------------------
 
-    id_map = get_espn_to_fantasypros_map()
+    id_map = (
+        get_espn_to_fantasypros_map()
+    )
 
     for player in players:
-        player["fantasypros_id"] = normalize_fp_id(
+
+        player[
+            "fantasypros_id"
+        ] = normalize_fp_id(
             id_map.get(
-                str(player["espn_id"])
+                str(
+                    player.get(
+                        "espn_id"
+                    )
+                )
             )
         )
 
     # --------------------------------------------------
-    # Group mapped players by position
+    # Group mapped players by FantasyPros position
     # --------------------------------------------------
 
-    players_by_position = defaultdict(list)
+    players_by_position = defaultdict(
+        list
+    )
 
     for player in players:
 
@@ -86,27 +333,33 @@ def enrich_players(
         if fp_id is None:
             continue
 
-        position = player["position"]
+        position = player.get(
+            "position"
+        )
 
-        # FantasyPros uses DST instead of D/ST
+        # FantasyPros uses DST instead of D/ST.
         if position == "D/ST":
             position = "DST"
 
         players_by_position[
             position
-        ].append(fp_id)
+        ].append(
+            fp_id
+        )
 
-    # --------------------------------------------------
-    # Weekly FantasyPros projections
-    # --------------------------------------------------
+    # ==================================================
+    # FantasyPros weekly projections
+    # ==================================================
 
     projections = {}
 
-    for position, fp_ids in (
-        players_by_position.items()
-    ):
+    for (
+        position,
+        fp_ids,
+    ) in players_by_position.items():
 
         try:
+
             result = (
                 get_projections_for_players(
                     season=season,
@@ -119,23 +372,118 @@ def enrich_players(
             for result_player in result:
 
                 fp_id = normalize_fp_id(
-                    result_player.get("fpid")
+                    result_player.get(
+                        "fpid"
+                    )
                 )
 
-                if fp_id is not None:
-                    projections[
-                        fp_id
-                    ] = result_player["stats"]
+                if fp_id is None:
+                    continue
+
+                projections[
+                    fp_id
+                ] = (
+                    result_player.get(
+                        "stats",
+                        {},
+                    )
+                )
 
         except Exception as e:
+
             print(
                 f"Could not get projections for "
                 f"{position}: {e}"
             )
 
-    # --------------------------------------------------
+    # ==================================================
+    # Special K / DST FantasyPros pools
+    #
+    # Only try this when:
+    #
+    #   1. the player is not mapped to FantasyPros
+    #   2. ESPN does NOT already give us a projection
+    #
+    # This prevents unnecessary API requests when ESPN
+    # can already provide a usable K/DST fallback.
+    # ==================================================
+
+    special_projection_pools = {
+        "K": [],
+        "DST": [],
+    }
+
+    needs_kicker_pool = any(
+        (
+            player.get(
+                "position"
+            ) == "K"
+            and player.get(
+                "fantasypros_id"
+            ) is None
+            and player.get(
+                "espn_projected_points"
+            ) is None
+        )
+        for player in players
+    )
+
+    needs_dst_pool = any(
+        (
+            player.get(
+                "position"
+            ) == "D/ST"
+            and player.get(
+                "fantasypros_id"
+            ) is None
+            and player.get(
+                "espn_projected_points"
+            ) is None
+        )
+        for player in players
+    )
+
+    if needs_kicker_pool:
+
+        try:
+
+            special_projection_pools[
+                "K"
+            ] = get_position_projections(
+                season=season,
+                week=week,
+                position="K",
+            )
+
+        except Exception as e:
+
+            print(
+                "Could not get full K "
+                f"projections: {e}"
+            )
+
+    if needs_dst_pool:
+
+        try:
+
+            special_projection_pools[
+                "DST"
+            ] = get_position_projections(
+                season=season,
+                week=week,
+                position="DST",
+            )
+
+        except Exception as e:
+
+            print(
+                "Could not get full DST "
+                f"projections: {e}"
+            )
+
+    # ==================================================
     # Weekly FantasyPros ECR
-    # --------------------------------------------------
+    # ==================================================
 
     ecr_data = {}
 
@@ -144,6 +492,7 @@ def enrich_players(
     ):
 
         try:
+
             result = (
                 get_consensus_rankings(
                     season=season,
@@ -154,7 +503,10 @@ def enrich_players(
             )
 
             for result_player in (
-                result.get("players", [])
+                result.get(
+                    "players",
+                    [],
+                )
             ):
 
                 fp_id = normalize_fp_id(
@@ -166,7 +518,9 @@ def enrich_players(
                 if fp_id is None:
                     continue
 
-                ecr_data[fp_id] = {
+                ecr_data[
+                    fp_id
+                ] = {
                     "rank_ecr":
                         result_player.get(
                             "rank_ecr"
@@ -210,21 +564,20 @@ def enrich_players(
                 }
 
         except Exception as e:
+
             print(
                 f"Could not get ECR for "
                 f"{position}: {e}"
             )
 
-    # --------------------------------------------------
+    # ==================================================
     # Player-specific rankings
     #
     # Used for:
-    #   1. Weekly ECR fallback
-    #   2. Rest-of-season rankings
     #
-    # This can be disabled for large free-agent pools
-    # so we do not make dozens of API requests.
-    # --------------------------------------------------
+    #   weekly ECR fallback
+    #   ROS FantasyPros ranking
+    # ==================================================
 
     ros_data = {}
 
@@ -234,20 +587,22 @@ def enrich_players(
         else []
     )
 
-    for player in players_for_specific_rankings:
+    for player in (
+        players_for_specific_rankings
+    ):
 
         fp_id = player.get(
             "fantasypros_id"
         )
 
-        position = player[
+        position = player.get(
             "position"
-        ]
+        )
 
         if fp_id is None:
             continue
 
-        # For now ROS is only used for
+        # ROS model currently applies only to
         # offensive skill positions.
         if position not in (
             "QB",
@@ -258,6 +613,7 @@ def enrich_players(
             continue
 
         try:
+
             result = (
                 get_rankings_for_player(
                     season=season,
@@ -267,14 +623,28 @@ def enrich_players(
             )
 
             for ranked_player in (
-                result.get("players", [])
+                result.get(
+                    "players",
+                    [],
+                )
             ):
 
                 ranked_id = normalize_fp_id(
-                    ranked_player.get("id")
+                    ranked_player.get(
+                        "id"
+                    )
                 )
 
-                if ranked_id != fp_id:
+                normalized_fp_id = (
+                    normalize_fp_id(
+                        fp_id
+                    )
+                )
+
+                if (
+                    ranked_id
+                    != normalized_fp_id
+                ):
                     continue
 
                 fp_position = (
@@ -312,36 +682,59 @@ def enrich_players(
                 # Weekly ECR fallback
                 # --------------------------------------
 
-                if fp_id not in ecr_data:
+                if (
+                    normalized_fp_id
+                    not in ecr_data
+                ):
 
                     weekly_ecr = (
                         ecr
-                        .get("PPR", {})
-                        .get(fp_position)
+                        .get(
+                            "PPR",
+                            {},
+                        )
+                        .get(
+                            fp_position
+                        )
                     )
 
                     weekly_min = (
                         ecr_min
-                        .get("PPR", {})
-                        .get(fp_position)
+                        .get(
+                            "PPR",
+                            {},
+                        )
+                        .get(
+                            fp_position
+                        )
                     )
 
                     weekly_max = (
                         ecr_max
-                        .get("PPR", {})
-                        .get(fp_position)
+                        .get(
+                            "PPR",
+                            {},
+                        )
+                        .get(
+                            fp_position
+                        )
                     )
 
                     weekly_std = (
                         ecr_std
-                        .get("PPR", {})
-                        .get(fp_position)
+                        .get(
+                            "PPR",
+                            {},
+                        )
+                        .get(
+                            fp_position
+                        )
                     )
 
                     if weekly_ecr is not None:
 
                         ecr_data[
-                            fp_id
+                            normalized_fp_id
                         ] = {
                             "rank_ecr":
                                 weekly_ecr,
@@ -372,7 +765,7 @@ def enrich_players(
                         }
 
                 # --------------------------------------
-                # Rest-of-season ECR
+                # ROS FantasyPros ECR
                 # --------------------------------------
 
                 ros_ecr = (
@@ -381,7 +774,9 @@ def enrich_players(
                         "ROS-PPR",
                         {},
                     )
-                    .get(fp_position)
+                    .get(
+                        fp_position
+                    )
                 )
 
                 ros_min = (
@@ -390,7 +785,9 @@ def enrich_players(
                         "ROS-PPR",
                         {},
                     )
-                    .get(fp_position)
+                    .get(
+                        fp_position
+                    )
                 )
 
                 ros_max = (
@@ -399,7 +796,9 @@ def enrich_players(
                         "ROS-PPR",
                         {},
                     )
-                    .get(fp_position)
+                    .get(
+                        fp_position
+                    )
                 )
 
                 ros_std = (
@@ -408,13 +807,15 @@ def enrich_players(
                         "ROS-PPR",
                         {},
                     )
-                    .get(fp_position)
+                    .get(
+                        fp_position
+                    )
                 )
 
                 if ros_ecr is not None:
 
                     ros_data[
-                        fp_id
+                        normalized_fp_id
                     ] = {
                         "ros_ecr":
                             ros_ecr,
@@ -436,15 +837,19 @@ def enrich_players(
                     }
 
         except Exception as e:
+
             print(
                 f"Could not get player "
                 f"rankings for "
                 f"{player['name']}: {e}"
             )
 
-    # --------------------------------------------------
+    # ==================================================
     # Attach weekly projections
-    # --------------------------------------------------
+    #
+    # IMPORTANT:
+    # This is OUTSIDE the player-specific rankings loop.
+    # ==================================================
 
     for player in players:
 
@@ -452,41 +857,209 @@ def enrich_players(
             "fantasypros_id"
         )
 
-        normalized_fp_id = normalize_fp_id(
-            fp_id
+        normalized_fp_id = (
+            normalize_fp_id(
+                fp_id
+            )
+        )
+
+        position = player.get(
+            "position"
         )
 
         stats = projections.get(
             normalized_fp_id
         )
 
+        # --------------------------------------------------
+        # Special FantasyPros fallback for unmapped K/DST
+        # --------------------------------------------------
+
+        matched_projection = None
+
+        if (
+            position == "K"
+            and special_projection_pools[
+                "K"
+            ]
+        ):
+
+            matched_projection = (
+                find_special_projection(
+                    player,
+                    special_projection_pools[
+                        "K"
+                    ],
+                )
+            )
+
+        elif (
+            position == "D/ST"
+            and special_projection_pools[
+                "DST"
+            ]
+        ):
+
+            matched_projection = (
+                find_special_projection(
+                    player,
+                    special_projection_pools[
+                        "DST"
+                    ],
+                )
+            )
+
+        if matched_projection is not None:
+
+            matched_fp_id = normalize_fp_id(
+                matched_projection.get(
+                    "fpid"
+                )
+                or matched_projection.get(
+                    "player_id"
+                )
+            )
+
+            if matched_fp_id is not None:
+
+                player[
+                    "fantasypros_id"
+                ] = matched_fp_id
+
+            matched_stats = (
+                matched_projection.get(
+                    "stats"
+                )
+            )
+
+            if matched_stats:
+                stats = matched_stats
+
+        # --------------------------------------------------
+        # FantasyPros projection available
+        # --------------------------------------------------
+
         if stats:
 
-            player["fp_std"] = (
-                stats.get("points")
+            standard_points = stats.get(
+                "points"
             )
 
-            player["fp_half"] = (
-                stats.get(
-                    "points_half"
-                )
+            half_points = stats.get(
+                "points_half"
             )
 
-            player["fp_ppr"] = (
-                stats.get(
-                    "points_ppr"
-                )
+            ppr_points = stats.get(
+                "points_ppr"
             )
+
+            # ----------------------------------------------
+            # K / DST
+            #
+            # Reception scoring doesn't matter here.
+            # FantasyPros may only populate "points".
+            # ----------------------------------------------
+
+            if position in (
+                "K",
+                "D/ST",
+            ):
+
+                player[
+                    "fp_std"
+                ] = standard_points
+
+                player[
+                    "fp_half"
+                ] = (
+                    half_points
+                    if half_points is not None
+                    else standard_points
+                )
+
+                player[
+                    "fp_ppr"
+                ] = (
+                    ppr_points
+                    if ppr_points is not None
+                    else standard_points
+                )
+
+            else:
+
+                player[
+                    "fp_std"
+                ] = standard_points
+
+                player[
+                    "fp_half"
+                ] = half_points
+
+                player[
+                    "fp_ppr"
+                ] = ppr_points
+
+            player[
+                "projection_source"
+            ] = "FantasyPros"
+
+        # --------------------------------------------------
+        # ESPN fallback for K / DST
+        # --------------------------------------------------
 
         else:
 
-            player["fp_std"] = None
-            player["fp_half"] = None
-            player["fp_ppr"] = None
+            espn_projection = (
+                player.get(
+                    "espn_projected_points"
+                )
+            )
 
-    # --------------------------------------------------
+            if (
+                position in (
+                    "K",
+                    "D/ST",
+                )
+                and espn_projection is not None
+            ):
+
+                player[
+                    "fp_std"
+                ] = espn_projection
+
+                player[
+                    "fp_half"
+                ] = espn_projection
+
+                player[
+                    "fp_ppr"
+                ] = espn_projection
+
+                player[
+                    "projection_source"
+                ] = "ESPN"
+
+            else:
+
+                player[
+                    "fp_std"
+                ] = None
+
+                player[
+                    "fp_half"
+                ] = None
+
+                player[
+                    "fp_ppr"
+                ] = None
+
+                player[
+                    "projection_source"
+                ] = None
+
+    # ==================================================
     # Attach weekly ECR
-    # --------------------------------------------------
+    # ==================================================
 
     for player in players:
 
@@ -495,30 +1068,42 @@ def enrich_players(
         )
 
         ranking = ecr_data.get(
-            normalize_fp_id(fp_id)
+            normalize_fp_id(
+                fp_id
+            )
         )
 
         if ranking:
 
-            player["ecr"] = (
-                ranking["rank_ecr"]
-            )
+            player[
+                "ecr"
+            ] = ranking[
+                "rank_ecr"
+            ]
 
-            player["rank_min"] = (
-                ranking["rank_min"]
-            )
+            player[
+                "rank_min"
+            ] = ranking[
+                "rank_min"
+            ]
 
-            player["rank_max"] = (
-                ranking["rank_max"]
-            )
+            player[
+                "rank_max"
+            ] = ranking[
+                "rank_max"
+            ]
 
-            player["rank_std"] = (
-                ranking["rank_std"]
-            )
+            player[
+                "rank_std"
+            ] = ranking[
+                "rank_std"
+            ]
 
-            player["pos_rank"] = (
-                ranking["pos_rank"]
-            )
+            player[
+                "pos_rank"
+            ] = ranking[
+                "pos_rank"
+            ]
 
             player[
                 "start_sit_grade"
@@ -526,35 +1111,55 @@ def enrich_players(
                 "start_sit_grade"
             ]
 
-            player["opponent"] = (
-                ranking["opponent"]
-            )
+            player[
+                "opponent"
+            ] = ranking[
+                "opponent"
+            ]
 
             player[
                 "expert_rankings"
-            ] = ranking["experts"]
+            ] = ranking[
+                "experts"
+            ]
 
         else:
 
-            player["ecr"] = None
-            player["rank_min"] = None
-            player["rank_max"] = None
-            player["rank_std"] = None
-            player["pos_rank"] = None
+            player[
+                "ecr"
+            ] = None
+
+            player[
+                "rank_min"
+            ] = None
+
+            player[
+                "rank_max"
+            ] = None
+
+            player[
+                "rank_std"
+            ] = None
+
+            player[
+                "pos_rank"
+            ] = None
 
             player[
                 "start_sit_grade"
             ] = None
 
-            player["opponent"] = None
+            player[
+                "opponent"
+            ] = None
 
             player[
                 "expert_rankings"
             ] = {}
 
-    # --------------------------------------------------
-    # Attach rest-of-season rankings
-    # --------------------------------------------------
+    # ==================================================
+    # Attach ROS FantasyPros rankings
+    # ==================================================
 
     for player in players:
 
@@ -563,14 +1168,18 @@ def enrich_players(
         )
 
         ros = ros_data.get(
-            normalize_fp_id(fp_id)
+            normalize_fp_id(
+                fp_id
+            )
         )
 
         if ros:
 
-            player["ros_ecr"] = (
-                ros["ros_ecr"]
-            )
+            player[
+                "ros_ecr"
+            ] = ros[
+                "ros_ecr"
+            ]
 
             player[
                 "ros_pos_rank"
@@ -578,37 +1187,55 @@ def enrich_players(
                 "ros_pos_rank"
             ]
 
-            player["ros_min"] = (
-                ros["ros_min"]
-            )
+            player[
+                "ros_min"
+            ] = ros[
+                "ros_min"
+            ]
 
-            player["ros_max"] = (
-                ros["ros_max"]
-            )
+            player[
+                "ros_max"
+            ] = ros[
+                "ros_max"
+            ]
 
-            player["ros_std"] = (
-                ros["ros_std"]
-            )
+            player[
+                "ros_std"
+            ] = ros[
+                "ros_std"
+            ]
 
         else:
 
-            player["ros_ecr"] = None
+            player[
+                "ros_ecr"
+            ] = None
 
             player[
                 "ros_pos_rank"
             ] = None
 
-            player["ros_min"] = None
-            player["ros_max"] = None
-            player["ros_std"] = None
+            player[
+                "ros_min"
+            ] = None
 
-    # --------------------------------------------------
-    # Attach recent NFL usage
-    # --------------------------------------------------
+            player[
+                "ros_max"
+            ] = None
+
+            player[
+                "ros_std"
+            ] = None
+
+    # ==================================================
+    # Recent NFL usage
+    # ==================================================
 
     for player in players:
 
-        if player["position"] in (
+        if player.get(
+            "position"
+        ) in (
             "K",
             "D/ST",
         ):
@@ -625,7 +1252,9 @@ def enrich_players(
                 "recent_usage"
             ] = get_recent_usage(
                 player_name=(
-                    player["name"]
+                    player.get(
+                        "name"
+                    )
                 ),
                 current_week=week,
                 last_n=3,
@@ -636,52 +1265,94 @@ def enrich_players(
             print(
                 f"Could not get recent "
                 f"stats for "
-                f"{player['name']}: {e}"
+                f"{player.get('name')}: "
+                f"{e}"
             )
 
             player[
                 "recent_usage"
             ] = None
 
-    # --------------------------------------------------
-    # Attach independent LeagueLogs market + ROS signals
-    # --------------------------------------------------
+    # ==================================================
+    # LeagueLogs
+    # ==================================================
 
     try:
+
         attach_leaguelogs_signals(
             players
         )
 
     except Exception as e:
+
         print(
-            f"Could not get LeagueLogs data: {e}"
+            f"Could not get LeagueLogs data: "
+            f"{e}"
         )
 
-        # Keep the rest of the pipeline working even if
-        # LeagueLogs is temporarily unavailable.
         for player in players:
+
             player.setdefault(
                 "signals",
                 {},
             )
 
-            player["signals"][
+            player[
+                "signals"
+            ][
                 "leaguelogs"
             ] = {
-                "matched": False,
+                "matched":
+                    False,
             }
 
-    
-    # --------------------------------------------------
-    # Calculate weekly + ROS value scores
-    # --------------------------------------------------
-    
+    # ==================================================
+    # Bye detection
+    #
+    # Use both nflverse schedule data and ESPN's
+    # BoxPlayer bye flag.
+    # ==================================================
+
+    for player in players:
+
+        schedule_bye = (
+            is_team_on_bye(
+                player.get(
+                    "nfl_team"
+                ),
+                week,
+            )
+        )
+
+        espn_bye = bool(
+            player.get(
+                "espn_on_bye",
+                False,
+            )
+        )
+
+        player[
+            "is_on_bye"
+        ] = (
+            schedule_bye
+            or espn_bye
+        )
+
+    # ==================================================
+    # Calculate weekly + ROS scores
+    # ==================================================
+
     add_player_values(
         players,
-        current_week=week
+        current_week=week,
     )
 
     return players
+
+
+# ==================================================
+# Add player-specific rankings to waiver shortlist
+# ==================================================
 
 def add_specific_rankings(
     players,
@@ -690,8 +1361,7 @@ def add_specific_rankings(
 ):
     """
     Add player-specific FantasyPros ranking data to
-    players that have already gone through the basic
-    enrichment pipeline.
+    players that already went through enrich_players().
 
     This does NOT refetch projections or bulk ECR.
     """
@@ -718,29 +1388,44 @@ def add_specific_rankings(
             continue
 
         try:
-            result = get_rankings_for_player(
-                season=season,
-                week=week,
-                player_id=fp_id,
+
+            result = (
+                get_rankings_for_player(
+                    season=season,
+                    week=week,
+                    player_id=fp_id,
+                )
             )
 
-            for ranked_player in result.get(
-                "players", []
+            for ranked_player in (
+                result.get(
+                    "players",
+                    [],
+                )
             ):
 
                 ranked_id = normalize_fp_id(
-                    ranked_player.get("id")
+                    ranked_player.get(
+                        "id"
+                    )
                 )
 
-                normalized_fp_id = normalize_fp_id(
-                    fp_id
+                normalized_fp_id = (
+                    normalize_fp_id(
+                        fp_id
+                    )
                 )
 
-                if ranked_id != normalized_fp_id:
+                if (
+                    ranked_id
+                    != normalized_fp_id
+                ):
                     continue
 
-                fp_position = ranked_player.get(
-                    "position_id"
+                fp_position = (
+                    ranked_player.get(
+                        "position_id"
+                    )
                 )
 
                 rank = ranked_player.get(
@@ -769,44 +1454,74 @@ def add_specific_rankings(
                 )
 
                 # --------------------------------------
-                # Weekly fallback
+                # Weekly ECR fallback
                 # --------------------------------------
 
-                if player.get("ecr") is None:
+                if player.get(
+                    "ecr"
+                ) is None:
 
                     weekly_ecr = (
                         ecr
-                        .get("PPR", {})
-                        .get(fp_position)
+                        .get(
+                            "PPR",
+                            {},
+                        )
+                        .get(
+                            fp_position
+                        )
                     )
 
                     if weekly_ecr is not None:
 
-                        player["ecr"] = (
-                            weekly_ecr
-                        )
+                        player[
+                            "ecr"
+                        ] = weekly_ecr
 
-                        player["pos_rank"] = (
+                        player[
+                            "pos_rank"
+                        ] = (
                             f"{fp_position}"
                             f"{weekly_ecr}"
                         )
 
-                        player["rank_min"] = (
+                        player[
+                            "rank_min"
+                        ] = (
                             ecr_min
-                            .get("PPR", {})
-                            .get(fp_position)
+                            .get(
+                                "PPR",
+                                {},
+                            )
+                            .get(
+                                fp_position
+                            )
                         )
 
-                        player["rank_max"] = (
+                        player[
+                            "rank_max"
+                        ] = (
                             ecr_max
-                            .get("PPR", {})
-                            .get(fp_position)
+                            .get(
+                                "PPR",
+                                {},
+                            )
+                            .get(
+                                fp_position
+                            )
                         )
 
-                        player["rank_std"] = (
+                        player[
+                            "rank_std"
+                        ] = (
                             ecr_std
-                            .get("PPR", {})
-                            .get(fp_position)
+                            .get(
+                                "PPR",
+                                {},
+                            )
+                            .get(
+                                fp_position
+                            )
                         )
 
                 # --------------------------------------
@@ -815,15 +1530,20 @@ def add_specific_rankings(
 
                 ros_ecr = (
                     ecr
-                    .get("ROS-PPR", {})
-                    .get(fp_position)
+                    .get(
+                        "ROS-PPR",
+                        {},
+                    )
+                    .get(
+                        fp_position
+                    )
                 )
 
                 if ros_ecr is not None:
 
-                    player["ros_ecr"] = (
-                        ros_ecr
-                    )
+                    player[
+                        "ros_ecr"
+                    ] = ros_ecr
 
                     player[
                         "ros_pos_rank"
@@ -832,35 +1552,57 @@ def add_specific_rankings(
                         f"{ros_ecr}"
                     )
 
-                    player["ros_min"] = (
+                    player[
+                        "ros_min"
+                    ] = (
                         ecr_min
-                        .get("ROS-PPR", {})
-                        .get(fp_position)
+                        .get(
+                            "ROS-PPR",
+                            {},
+                        )
+                        .get(
+                            fp_position
+                        )
                     )
 
-                    player["ros_max"] = (
+                    player[
+                        "ros_max"
+                    ] = (
                         ecr_max
-                        .get("ROS-PPR", {})
-                        .get(fp_position)
+                        .get(
+                            "ROS-PPR",
+                            {},
+                        )
+                        .get(
+                            fp_position
+                        )
                     )
 
-                    player["ros_std"] = (
+                    player[
+                        "ros_std"
+                    ] = (
                         ecr_std
-                        .get("ROS-PPR", {})
-                        .get(fp_position)
+                        .get(
+                            "ROS-PPR",
+                            {},
+                        )
+                        .get(
+                            fp_position
+                        )
                     )
 
         except Exception as e:
 
             print(
                 f"Could not get specific rankings "
-                f"for {player['name']}: {e}"
+                f"for {player.get('name')}: "
+                f"{e}"
             )
 
-    # Rankings changed, so recalculate values.
+    # Rankings changed, so recalculate player values.
     add_player_values(
         players,
-        current_week=week
+        current_week=week,
     )
 
     return players

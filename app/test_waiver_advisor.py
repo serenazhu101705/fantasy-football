@@ -1,7 +1,11 @@
 from waiver_advisor import (
     evaluate_transaction,
+    evaluate_all_transactions,
+    rank_transactions,
+    get_drop_candidates,
 )
 from itertools import count
+
 
 TEST_PLAYER_ID = count(1)
 
@@ -377,3 +381,108 @@ print(
     "Reason:",
     result["recommendation_reason"],
 )
+
+print(
+    "\n=== DROP CANDIDATES ==="
+)
+
+drop_candidates = (
+    get_drop_candidates(
+        roster
+    )
+)
+
+for player in roster:
+
+    print(
+        f"{player['name']:20} "
+        f"protected="
+        f"{player.get('waiver_protected')} "
+        f"reason="
+        f"{player.get('protection_reason')}"
+    )
+
+
+print(
+    "\n=== RANKED WAIVER MOVES ==="
+)
+
+waivers = [
+    good_add,
+    streamer,
+    stash,
+]
+
+results = (
+    evaluate_all_transactions(
+        roster,
+        waivers,
+    )
+)
+
+ranked = (
+    rank_transactions(
+        results
+    )
+)
+
+for i, result in enumerate(
+    ranked[:10],
+    start=1,
+):
+
+    print(
+        f"\n{i}. "
+        f"ADD {result['add']['name']} "
+        f"/ DROP {result['drop']['name']}"
+    )
+
+    print(
+        "   Recommendation:",
+        result["recommendation"],
+    )
+
+    print(
+        "   Weekly lineup delta:",
+        result[
+            "weekly_lineup_delta"
+        ],
+    )
+
+    print(
+        "   ROS delta:",
+        result[
+            "ros_delta"
+        ],
+    )
+
+    print(
+        "   Market delta:",
+        result[
+            "market_value_delta"
+        ],
+    )
+
+    print(
+        "   Reason:",
+        result[
+            "recommendation_reason"
+        ],
+    )
+    print(
+        "   Roster balance:",
+        result["roster_balance_delta"],
+    )
+
+    print(
+        "   Depth risk:",
+        result["depth_risk"],
+    )
+
+    if result["depth_risks"]:
+        print(
+            "   Depth warnings:",
+            ", ".join(
+                result["depth_risks"]
+            ),
+        )
