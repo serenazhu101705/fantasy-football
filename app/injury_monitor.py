@@ -4,9 +4,15 @@ import os
 import re
 import time
 import unicodedata
+import hashlib
 
 import requests
 from dotenv import load_dotenv
+
+from fantasypros_client import (
+    fantasypros_is_blocked,
+    mark_fantasypros_blocked,
+)
 
 
 # ==================================================
@@ -149,10 +155,27 @@ def fantasypros_get(
     endpoint,
     params=None,
 ):
+    """
+    Make a FantasyPros request while respecting the
+    shared per-run 429 circuit breaker.
+    """
+
     if not API_KEY:
 
         raise RuntimeError(
             "FANTASYPROS_API_KEY is not set."
+        )
+
+    # --------------------------------------------------
+    # Circuit breaker
+    # --------------------------------------------------
+
+    if fantasypros_is_blocked():
+
+        raise requests.RequestException(
+            "FantasyPros request skipped because an "
+            "earlier request returned HTTP 429 "
+            "during this run."
         )
 
     url = (
@@ -169,33 +192,401 @@ def fantasypros_get(
         timeout=30,
     )
 
+    # --------------------------------------------------
+    # Open shared circuit on 429
+    # --------------------------------------------------
+
+    if response.status_code == 429:
+
+        mark_fantasypros_blocked(
+            reason=(
+                "FantasyPros injury/news endpoint "
+                "returned HTTP 429."
+            )
+        )
+
+        print(
+            "[FANTASYPROS CIRCUIT OPEN] "
+            "Skipping additional FantasyPros API "
+            "requests for the rest of this run."
+        )
+
     response.raise_for_status()
 
     return response.json()
 
-
 # ==================================================
 # Injury feed
 # ==================================================
+def _last_good_cache_path(
+    season,
+    week,
+):
+    """
+    Shared per-week injury cache.
+
+    Unlike the normal cache, this is NOT tied to one
+    exact set of requested player IDs.
+    """
+
+    return (
+        CACHE_DIR
+        / (
+            f"injuries_{season}_"
+            f"week{week}_"
+            f"last_good.json"
+        )
+    )
+
+
+def _merge_injury_payloads(
+    *payloads,
+):
+    """
+    Merge injury responses by FantasyPros player ID.
+
+    Later payloads overwrite earlier payloads so the
+    newest known report wins.
+    """
+
+    merged = {}
+
+    for payload in payloads:
+
+        if not payload:
+            continue
+
+        injuries = (
+            payload.get(
+                "injuries"
+            )
+            or []
+        )
+
+        for injury in injuries:
+
+            player_id = injury.get(
+                "player_id"
+            )
+
+            if player_id is not None:
+
+                key = (
+                    "id:"
+                    + str(
+                        player_id
+                    )
+                )
+
+            else:
+
+                # Defensive fallback in case FantasyPros
+                # ever returns an injury without an ID.
+                name = normalize_name(
+                    injury.get(
+                        "name"
+                    )
+                )
+
+                if not name:
+                    continue
+
+                key = (
+                    "name:"
+                    + name
+                )
+
+            merged[
+                key
+            ] = injury
+
+    return {
+        "count":
+            len(
+                merged
+            ),
+
+        "injuries":
+            list(
+                merged.values()
+            ),
+    }
+
+
+def _update_last_good_cache(
+    season,
+    week,
+    new_data,
+):
+    """
+    Merge newly received injury data into the shared
+    weekly last-good cache.
+    """
+
+    path = _last_good_cache_path(
+        season,
+        week,
+    )
+
+    existing = {}
+
+    if path.exists():
+
+        try:
+
+            existing = load_json_cache(
+                path
+            )
+
+        except Exception:
+
+            existing = {}
+
+    merged = _merge_injury_payloads(
+        existing,
+        new_data,
+    )
+
+    if merged.get(
+        "injuries"
+    ):
+
+        save_json_cache(
+            path,
+            merged,
+        )
+
+    return merged
+
+
+def _bootstrap_last_good_cache(
+    season,
+    week,
+):
+    """
+    Build/rebuild the shared weekly injury cache from
+    every injury cache file we already have on disk.
+
+    This lets the new cache immediately benefit from
+    older exact-player-set caches.
+    """
+
+    last_good_path = (
+        _last_good_cache_path(
+            season,
+            week,
+        )
+    )
+
+    payloads = []
+
+    # --------------------------------------------------
+    # Existing shared cache first
+    # --------------------------------------------------
+
+    if last_good_path.exists():
+
+        try:
+
+            payloads.append(
+                load_json_cache(
+                    last_good_path
+                )
+            )
+
+        except Exception:
+
+            pass
+
+    # --------------------------------------------------
+    # Existing exact/request caches
+    #
+    # Sort by modification time so newer information
+    # overwrites older information.
+    # --------------------------------------------------
+
+    cache_files = list(
+        CACHE_DIR.glob(
+            f"injuries_{season}_"
+            f"week{week}*.json"
+        )
+    )
+
+    cache_files = [
+        path
+        for path in cache_files
+        if path != last_good_path
+    ]
+
+    cache_files.sort(
+        key=lambda path:
+            path.stat().st_mtime
+    )
+
+    for path in cache_files:
+
+        try:
+
+            payloads.append(
+                load_json_cache(
+                    path
+                )
+            )
+
+        except Exception:
+
+            continue
+
+    merged = _merge_injury_payloads(
+        *payloads
+    )
+
+    if merged.get(
+        "injuries"
+    ):
+
+        save_json_cache(
+            last_good_path,
+            merged,
+        )
+
+    return merged
+
+
+def _filter_injury_data(
+    data,
+    player_ids,
+):
+    """
+    Return only injury rows for the requested players.
+    """
+
+    if not player_ids:
+        return data
+
+    requested = {
+        str(
+            player_id
+        )
+        for player_id in player_ids
+    }
+
+    injuries = []
+
+    for injury in (
+        data.get(
+            "injuries"
+        )
+        or []
+    ):
+
+        player_id = injury.get(
+            "player_id"
+        )
+
+        if player_id is None:
+            continue
+
+        if str(
+            player_id
+        ) in requested:
+
+            injuries.append(
+                injury
+            )
+
+    return {
+        "count":
+            len(
+                injuries
+            ),
+
+        "injuries":
+            injuries,
+    }
 
 def get_injuries(
     season,
     week,
+    player_ids=None,
     force_refresh=False,
 ):
     """
-    Get the structured FantasyPros NFL injury feed.
+    Get structured FantasyPros injury data.
 
-    include_probabilities=true is important because
-    it can include players who appear on practice
-    reports even when they do not yet have a normal
-    game-status designation.
+    Cache strategy:
+
+        1. Use fresh exact-player cache when available.
+
+        2. Otherwise try FantasyPros.
+
+        3. Save successful responses both to:
+               - exact request cache
+               - shared weekly last-good cache
+
+        4. If FantasyPros fails:
+               - prefer stale exact cache
+               - otherwise use any matching players from
+                 the shared weekly last-good cache
+               - otherwise return an empty injury list so
+                 ESPN injury status can still be used
     """
 
-    cache_path = (
-        CACHE_DIR
-        / f"injuries_{season}_week{week}.json"
-    )
+    clean_player_ids = []
+
+    if player_ids:
+
+        clean_player_ids = sorted(
+            {
+                str(
+                    player_id
+                )
+                for player_id in player_ids
+                if player_id is not None
+            }
+        )
+
+    # --------------------------------------------------
+    # Exact-request cache path
+    # --------------------------------------------------
+
+    if clean_player_ids:
+
+        player_id_string = ":".join(
+            clean_player_ids
+        )
+
+        cache_hash = (
+            hashlib.sha1(
+                player_id_string.encode(
+                    "utf-8"
+                )
+            )
+            .hexdigest()[:12]
+        )
+
+        cache_path = (
+            CACHE_DIR
+            / (
+                f"injuries_{season}_"
+                f"week{week}_"
+                f"players_{cache_hash}.json"
+            )
+        )
+
+    else:
+
+        cache_path = (
+            CACHE_DIR
+            / (
+                f"injuries_{season}_"
+                f"week{week}.json"
+            )
+        )
+
+    # --------------------------------------------------
+    # Fresh exact cache
+    # --------------------------------------------------
 
     if (
         not force_refresh
@@ -209,63 +600,235 @@ def get_injuries(
             f"{season} Week {week}"
         )
 
-        return load_json_cache(
+        data = load_json_cache(
             cache_path
         )
 
-    print(
-        f"[API] FantasyPros injuries "
-        f"{season} Week {week}"
-    )
+        # Also make sure the shared cache learns about
+        # anything contained in this exact cache.
+        _update_last_good_cache(
+            season=season,
+            week=week,
+            new_data=data,
+        )
 
-    data = fantasypros_get(
-        "nfl/injuries",
-        params={
-            "year":
-                season,
+        return data
 
-            "week":
-                week,
+    # --------------------------------------------------
+    # API parameters
+    # --------------------------------------------------
 
-            "include_probabilities":
-                "true",
-        },
-    )
+    params = {
+        "year":
+            season,
 
-    save_json_cache(
-        cache_path,
-        data,
-    )
+        "week":
+            week,
 
-    return data
+        "include_probabilities":
+            "true",
+    }
 
+    if clean_player_ids:
 
-# ==================================================
-# Injury news
-# ==================================================
+        params[
+            "player_ids"
+        ] = ":".join(
+            clean_player_ids
+        )
+
+    # --------------------------------------------------
+    # Try FantasyPros
+    # --------------------------------------------------
+
+    try:
+
+        print(
+            f"[API] FantasyPros injuries "
+            f"{season} Week {week}"
+        )
+
+        if clean_player_ids:
+
+            print(
+                f"      Requesting "
+                f"{len(clean_player_ids)} "
+                f"players"
+            )
+
+        data = fantasypros_get(
+            "nfl/injuries",
+            params=params,
+        )
+
+        injuries = (
+            data.get(
+                "injuries"
+            )
+            or []
+        )
+
+        print(
+            f"      API count="
+            f"{data.get('count')} "
+            f"returned="
+            f"{len(injuries)}"
+        )
+
+        # ----------------------------------------------
+        # Save exact request cache
+        # ----------------------------------------------
+
+        save_json_cache(
+            cache_path,
+            data,
+        )
+
+        # ----------------------------------------------
+        # Merge into shared weekly cache
+        # ----------------------------------------------
+
+        _update_last_good_cache(
+            season=season,
+            week=week,
+            new_data=data,
+        )
+
+        return data
+
+    # --------------------------------------------------
+    # FantasyPros failed
+    # --------------------------------------------------
+
+    except requests.RequestException as error:
+
+        # ----------------------------------------------
+        # Best fallback:
+        # stale cache for the exact same request
+        # ----------------------------------------------
+
+        if cache_path.exists():
+
+            age_seconds = (
+                time.time()
+                - cache_path.stat().st_mtime
+            )
+
+            age_minutes = (
+                age_seconds
+                / 60.0
+            )
+
+            print(
+                f"[STALE CACHE] FantasyPros injuries "
+                f"{season} Week {week} "
+                f"({age_minutes:.0f} min old) "
+                f"because API failed: "
+                f"{error}"
+            )
+
+            data = load_json_cache(
+                cache_path
+            )
+
+            _update_last_good_cache(
+                season=season,
+                week=week,
+                new_data=data,
+            )
+
+            return data
+
+        # ----------------------------------------------
+        # No exact cache.
+        #
+        # Build a shared cache from every injury response
+        # we have ever successfully cached this week.
+        # ----------------------------------------------
+
+        shared_data = (
+            _bootstrap_last_good_cache(
+                season=season,
+                week=week,
+            )
+        )
+
+        filtered_data = (
+            _filter_injury_data(
+                data=shared_data,
+                player_ids=clean_player_ids,
+            )
+        )
+
+        matched_count = len(
+            filtered_data.get(
+                "injuries",
+                [],
+            )
+        )
+
+        if matched_count > 0:
+
+            print(
+                f"[LAST-GOOD CACHE] "
+                f"FantasyPros injuries "
+                f"{season} Week {week}: "
+                f"recovered {matched_count}/"
+                f"{len(clean_player_ids)} "
+                f"requested players after API failure."
+            )
+
+            return filtered_data
+
+        # ----------------------------------------------
+        # No FantasyPros injury data is available for
+        # these players.
+        #
+        # Return an empty feed instead of crashing the
+        # entire enrichment pipeline. availability.py
+        # can then fall back to ESPN status.
+        # ----------------------------------------------
+
+        print(
+            f"[INJURY FALLBACK] "
+            f"No cached FantasyPros injury rows "
+            f"matched this request after API failure. "
+            f"Using ESPN injury status instead."
+        )
+
+        return {
+            "count":
+                0,
+
+            "injuries":
+                [],
+        }
 
 def get_injury_news(
     limit=100,
     force_refresh=False,
 ):
     """
-    Get recent NFL injury news.
+    Get recent FantasyPros NFL injury news.
 
-    This is separate from the structured practice
-    report because news can contain useful context
-    like:
+    Fresh cache:
+        use immediately
 
-        expected to play
-        game-time decision
-        setback
-        limited snaps expected
-        coach says player will play
+    Cache expired:
+        try FantasyPros API
+
+    API failure / 429:
+        fall back to stale cached news when available
     """
 
     cache_path = (
         CACHE_DIR
         / "injury_news.json"
     )
+
+    # --------------------------------------------------
+    # Fresh cache
+    # --------------------------------------------------
 
     if (
         not force_refresh
@@ -282,31 +845,67 @@ def get_injury_news(
             cache_path
         )
 
-    print(
-        "[API] FantasyPros injury news"
-    )
+    # --------------------------------------------------
+    # Try fresh API data
+    # --------------------------------------------------
 
-    data = fantasypros_get(
-        "nfl/news",
-        params={
-            "limit":
-                limit,
+    try:
 
-            "category":
-                "injury",
+        print(
+            "[API] FantasyPros injury news"
+        )
 
-            "order_by":
-                "created",
-        },
-    )
+        data = fantasypros_get(
+            "nfl/news",
+            params={
+                "limit":
+                    limit,
 
-    save_json_cache(
-        cache_path,
-        data,
-    )
+                "category":
+                    "injury",
 
-    return data
+                "order_by":
+                    "created",
+            },
+        )
 
+        save_json_cache(
+            cache_path,
+            data,
+        )
+
+        return data
+
+    # --------------------------------------------------
+    # API failed
+    # --------------------------------------------------
+
+    except requests.RequestException as error:
+
+        if cache_path.exists():
+
+            age_seconds = (
+                time.time()
+                - cache_path.stat().st_mtime
+            )
+
+            age_minutes = (
+                age_seconds
+                / 60.0
+            )
+
+            print(
+                "[STALE CACHE] FantasyPros injury news "
+                f"({age_minutes:.0f} min old) "
+                f"because API failed: "
+                f"{error}"
+            )
+
+            return load_json_cache(
+                cache_path
+            )
+
+        raise
 
 # ==================================================
 # Injury normalization
@@ -509,16 +1108,21 @@ def normalize_injury(
 def build_injury_lookup(
     season,
     week,
+    player_ids=None,
     force_refresh=False,
 ):
     """
     Build injury lookups by FantasyPros ID and
     normalized player name.
+
+    Request only the players we actually care about
+    whenever FantasyPros IDs are available.
     """
 
     data = get_injuries(
         season=season,
         week=week,
+        player_ids=player_ids,
         force_refresh=force_refresh,
     )
 
@@ -567,7 +1171,6 @@ def build_injury_lookup(
         "by_name":
             by_name,
     }
-
 
 # ==================================================
 # News lookup
@@ -697,18 +1300,64 @@ def attach_injury_signals(
     """
     Attach structured injury/practice information to
     roster or waiver players.
-
-    This function DOES NOT yet apply scoring penalties.
-
-    First we want to inspect the real data before
-    deciding how practice status should change lineup
-    value.
     """
+
+    # --------------------------------------------------
+    # Collect FantasyPros IDs first.
+    # --------------------------------------------------
+
+    roster_fp_ids = []
+
+    missing_fp_ids = []
+
+    for player in players:
+
+        fp_id = get_player_fp_id(
+            player
+        )
+
+        if fp_id is not None:
+
+            roster_fp_ids.append(
+                fp_id
+            )
+
+        else:
+
+            missing_fp_ids.append(
+                player.get(
+                    "name"
+                )
+            )
+
+    print(
+        f"[INJURY] FantasyPros IDs available: "
+        f"{len(roster_fp_ids)}/"
+        f"{len(players)}"
+    )
+
+    if missing_fp_ids:
+
+        print(
+            "[INJURY] Missing FantasyPros IDs:"
+        )
+
+        for name in missing_fp_ids:
+
+            print(
+                f"  - {name}"
+            )
+
+    # --------------------------------------------------
+    # Request injury reports specifically for the
+    # roster players.
+    # --------------------------------------------------
 
     injury_lookup = (
         build_injury_lookup(
             season=season,
             week=week,
+            player_ids=roster_fp_ids,
             force_refresh=force_refresh,
         )
     )
@@ -747,18 +1396,20 @@ def attach_injury_signals(
 
         injury = None
 
-        # Prefer FantasyPros ID.
+        # Prefer exact FantasyPros ID.
         if fp_id:
 
             injury = (
                 injury_lookup[
                     "by_fp_id"
                 ].get(
-                    fp_id
+                    str(
+                        fp_id
+                    )
                 )
             )
 
-        # Name fallback.
+        # Fallback to normalized name.
         if injury is None:
 
             injury = (
@@ -779,7 +1430,9 @@ def attach_injury_signals(
                 "injury_news"
             ] = (
                 news_lookup.get(
-                    fp_id,
+                    str(
+                        fp_id
+                    ),
                     [],
                 )
             )
@@ -795,7 +1448,6 @@ def attach_injury_signals(
         )
 
     return enriched
-
 
 # ==================================================
 # Printing / diagnostics

@@ -6,7 +6,8 @@ from fantasypros_client import (
     get_projections_for_players,
     get_position_projections,
     get_consensus_rankings,
-    get_rankings_for_player,
+    get_cached_rankings_for_player,
+    get_cached_consensus_rankings,
 )
 
 from leaguelogs_client import (
@@ -24,6 +25,10 @@ from player_ids import (
 
 from player_value import (
     add_player_values,
+)
+
+from injury_monitor import (
+    attach_injury_signals,
 )
 
 
@@ -270,12 +275,233 @@ def find_special_projection(
 # ==================================================
 # Main enrichment pipeline
 # ==================================================
+def add_cached_ranking_fallback(
+    player,
+    season,
+    week,
+):
+    """
+    Fill missing weekly and ROS FantasyPros rankings
+    from an existing individual-player cache.
+
+    This NEVER calls the FantasyPros API.
+    """
+
+    fp_id = normalize_fp_id(
+        player.get(
+            "fantasypros_id"
+        )
+    )
+
+    if fp_id is None:
+        return player
+
+    result = get_cached_rankings_for_player(
+        season=season,
+        week=week,
+        player_id=fp_id,
+    )
+
+    if not result:
+        return player
+
+    for ranked_player in (
+        result.get(
+            "players",
+            [],
+        )
+    ):
+
+        ranked_id = normalize_fp_id(
+            ranked_player.get(
+                "id"
+            )
+        )
+
+        if ranked_id != fp_id:
+            continue
+
+        position = ranked_player.get(
+            "position_id"
+        )
+
+        rank = ranked_player.get(
+            "rank",
+            {},
+        )
+
+        ecr = rank.get(
+            "ECR",
+            {},
+        )
+
+        ecr_min = rank.get(
+            "ECR_MIN",
+            {},
+        )
+
+        ecr_max = rank.get(
+            "ECR_MAX",
+            {},
+        )
+
+        ecr_std = rank.get(
+            "ECR_STD",
+            {},
+        )
+
+        # ----------------------------------------------
+        # Weekly fallback
+        # ----------------------------------------------
+
+        if player.get(
+            "ecr"
+        ) is None:
+
+            weekly_ecr = (
+                ecr
+                .get(
+                    "PPR",
+                    {},
+                )
+                .get(
+                    position
+                )
+            )
+
+            if weekly_ecr is not None:
+
+                player[
+                    "ecr"
+                ] = weekly_ecr
+
+                player[
+                    "pos_rank"
+                ] = (
+                    f"{position}"
+                    f"{weekly_ecr}"
+                )
+
+                player[
+                    "rank_min"
+                ] = (
+                    ecr_min
+                    .get(
+                        "PPR",
+                        {},
+                    )
+                    .get(
+                        position
+                    )
+                )
+
+                player[
+                    "rank_max"
+                ] = (
+                    ecr_max
+                    .get(
+                        "PPR",
+                        {},
+                    )
+                    .get(
+                        position
+                    )
+                )
+
+                player[
+                    "rank_std"
+                ] = (
+                    ecr_std
+                    .get(
+                        "PPR",
+                        {},
+                    )
+                    .get(
+                        position
+                    )
+                )
+
+        # ----------------------------------------------
+        # ROS fallback
+        # ----------------------------------------------
+
+        if player.get(
+            "ros_ecr"
+        ) is None:
+
+            ros_ecr = (
+                ecr
+                .get(
+                    "ROS-PPR",
+                    {},
+                )
+                .get(
+                    position
+                )
+            )
+
+            if ros_ecr is not None:
+
+                player[
+                    "ros_ecr"
+                ] = ros_ecr
+
+                player[
+                    "ros_pos_rank"
+                ] = (
+                    f"{position}"
+                    f"{ros_ecr}"
+                )
+
+                player[
+                    "ros_min"
+                ] = (
+                    ecr_min
+                    .get(
+                        "ROS-PPR",
+                        {},
+                    )
+                    .get(
+                        position
+                    )
+                )
+
+                player[
+                    "ros_max"
+                ] = (
+                    ecr_max
+                    .get(
+                        "ROS-PPR",
+                        {},
+                    )
+                    .get(
+                        position
+                    )
+                )
+
+                player[
+                    "ros_std"
+                ] = (
+                    ecr_std
+                    .get(
+                        "ROS-PPR",
+                        {},
+                    )
+                    .get(
+                        position
+                    )
+                )
+
+        break
+
+    return player
 
 def enrich_players(
     players,
     season,
     week,
     include_player_specific=True,
+    include_injuries=True,
 ):
     """
     Take raw ESPN players and attach:
@@ -288,6 +514,7 @@ def enrich_players(
         recent NFL usage
         LeagueLogs signals
         bye status
+        FantasyPros injury / practice signals
         weekly score
         ROS score
 
@@ -570,279 +797,100 @@ def enrich_players(
                 f"{position}: {e}"
             )
 
-    # ==================================================
-    # Player-specific rankings
+   # ==================================================
+    # Rest-of-season FantasyPros consensus rankings
     #
-    # Used for:
+    # IMPORTANT:
+    # Fetch one bulk ROS ranking list per position instead
+    # of making one FantasyPros API request per player.
     #
-    #   weekly ECR fallback
-    #   ROS FantasyPros ranking
+    # include_player_specific=False is still used during
+    # the large free-agent first pass so we avoid doing
+    # unnecessary ROS work for ~100 players.
     # ==================================================
 
     ros_data = {}
 
-    players_for_specific_rankings = (
-        players
-        if include_player_specific
-        else []
-    )
+    if include_player_specific:
 
-    for player in (
-        players_for_specific_rankings
-    ):
-
-        fp_id = player.get(
-            "fantasypros_id"
-        )
-
-        position = player.get(
-            "position"
-        )
-
-        if fp_id is None:
-            continue
-
-        # ROS model currently applies only to
-        # offensive skill positions.
-        if position not in (
-            "QB",
-            "RB",
-            "WR",
-            "TE",
+        for position in (
+            players_by_position.keys()
         ):
-            continue
 
-        try:
-
-            result = (
-                get_rankings_for_player(
-                    season=season,
-                    week=week,
-                    player_id=fp_id,
-                )
-            )
-
-            for ranked_player in (
-                result.get(
-                    "players",
-                    [],
-                )
+            # ROS values are currently only useful for
+            # offensive fantasy positions.
+            if position not in (
+                "QB",
+                "RB",
+                "WR",
+                "TE",
             ):
+                continue
 
-                ranked_id = normalize_fp_id(
-                    ranked_player.get(
-                        "id"
+            try:
+
+                result = (
+                    get_consensus_rankings(
+                        season=season,
+                        week=week,
+                        position=position,
+                        scoring="PPR",
+                        ranking_type="ROS",
                     )
                 )
 
-                normalized_fp_id = (
-                    normalize_fp_id(
-                        fp_id
+                for result_player in (
+                    result.get(
+                        "players",
+                        [],
                     )
-                )
-
-                if (
-                    ranked_id
-                    != normalized_fp_id
-                ):
-                    continue
-
-                fp_position = (
-                    ranked_player.get(
-                        "position_id"
-                    )
-                )
-
-                rank = ranked_player.get(
-                    "rank",
-                    {},
-                )
-
-                ecr = rank.get(
-                    "ECR",
-                    {},
-                )
-
-                ecr_min = rank.get(
-                    "ECR_MIN",
-                    {},
-                )
-
-                ecr_max = rank.get(
-                    "ECR_MAX",
-                    {},
-                )
-
-                ecr_std = rank.get(
-                    "ECR_STD",
-                    {},
-                )
-
-                # --------------------------------------
-                # Weekly ECR fallback
-                # --------------------------------------
-
-                if (
-                    normalized_fp_id
-                    not in ecr_data
                 ):
 
-                    weekly_ecr = (
-                        ecr
-                        .get(
-                            "PPR",
-                            {},
-                        )
-                        .get(
-                            fp_position
+                    fp_id = normalize_fp_id(
+                        result_player.get(
+                            "player_id"
                         )
                     )
 
-                    weekly_min = (
-                        ecr_min
-                        .get(
-                            "PPR",
-                            {},
-                        )
-                        .get(
-                            fp_position
-                        )
-                    )
-
-                    weekly_max = (
-                        ecr_max
-                        .get(
-                            "PPR",
-                            {},
-                        )
-                        .get(
-                            fp_position
-                        )
-                    )
-
-                    weekly_std = (
-                        ecr_std
-                        .get(
-                            "PPR",
-                            {},
-                        )
-                        .get(
-                            fp_position
-                        )
-                    )
-
-                    if weekly_ecr is not None:
-
-                        ecr_data[
-                            normalized_fp_id
-                        ] = {
-                            "rank_ecr":
-                                weekly_ecr,
-
-                            "rank_min":
-                                weekly_min,
-
-                            "rank_max":
-                                weekly_max,
-
-                            "rank_std":
-                                weekly_std,
-
-                            "pos_rank":
-                                (
-                                    f"{fp_position}"
-                                    f"{weekly_ecr}"
-                                ),
-
-                            "start_sit_grade":
-                                None,
-
-                            "opponent":
-                                None,
-
-                            "experts":
-                                {},
-                        }
-
-                # --------------------------------------
-                # ROS FantasyPros ECR
-                # --------------------------------------
-
-                ros_ecr = (
-                    ecr
-                    .get(
-                        "ROS-PPR",
-                        {},
-                    )
-                    .get(
-                        fp_position
-                    )
-                )
-
-                ros_min = (
-                    ecr_min
-                    .get(
-                        "ROS-PPR",
-                        {},
-                    )
-                    .get(
-                        fp_position
-                    )
-                )
-
-                ros_max = (
-                    ecr_max
-                    .get(
-                        "ROS-PPR",
-                        {},
-                    )
-                    .get(
-                        fp_position
-                    )
-                )
-
-                ros_std = (
-                    ecr_std
-                    .get(
-                        "ROS-PPR",
-                        {},
-                    )
-                    .get(
-                        fp_position
-                    )
-                )
-
-                if ros_ecr is not None:
+                    if fp_id is None:
+                        continue
 
                     ros_data[
-                        normalized_fp_id
+                        fp_id
                     ] = {
                         "ros_ecr":
-                            ros_ecr,
+                            result_player.get(
+                                "rank_ecr"
+                            ),
 
                         "ros_min":
-                            ros_min,
+                            result_player.get(
+                                "rank_min"
+                            ),
 
                         "ros_max":
-                            ros_max,
+                            result_player.get(
+                                "rank_max"
+                            ),
 
                         "ros_std":
-                            ros_std,
+                            result_player.get(
+                                "rank_std"
+                            ),
 
                         "ros_pos_rank":
-                            (
-                                f"{fp_position}"
-                                f"{ros_ecr}"
+                            result_player.get(
+                                "pos_rank"
                             ),
                     }
 
-        except Exception as e:
+            except Exception as e:
 
-            print(
-                f"Could not get player "
-                f"rankings for "
-                f"{player['name']}: {e}"
-            )
+                print(
+                    f"Could not get ROS ECR for "
+                    f"{position}: {e}"
+                )
+
 
     # ==================================================
     # Attach weekly projections
@@ -1226,7 +1274,24 @@ def enrich_players(
             player[
                 "ros_std"
             ] = None
+    # ==================================================
+    # Cache-only ranking fallback
+    #
+    # For roster-sized enrichment, use any individual
+    # ranking files we already have on disk to fill gaps.
+    #
+    # This makes ZERO FantasyPros API requests.
+    # ==================================================
 
+    if include_player_specific:
+
+        for player in players:
+
+            add_cached_ranking_fallback(
+                player=player,
+                season=season,
+                week=week,
+            )
     # ==================================================
     # Recent NFL usage
     # ==================================================
@@ -1339,16 +1404,50 @@ def enrich_players(
         )
 
     # ==================================================
-    # Calculate weekly + ROS scores
+    # Injury / practice monitoring
     # ==================================================
 
+    if include_injuries:
+
+        try:
+
+            players = attach_injury_signals(
+                players=players,
+                season=season,
+                week=week,
+                include_news=True,
+                force_refresh=False,
+            )
+
+        except Exception as e:
+
+            print(
+                "Could not get injury / practice data: "
+                f"{e}"
+            )
+
+            for player in players:
+
+                player.setdefault(
+                    "injury_report",
+                    None,
+                )
+
+                player.setdefault(
+                    "injury_news",
+                    [],
+                )
+
+    # ==================================================
+    # Calculate weekly + ROS scores
+    # ==================================================
+        
     add_player_values(
         players,
         current_week=week,
     )
 
     return players
-
 
 # ==================================================
 # Add player-specific rankings to waiver shortlist
@@ -1360,20 +1459,34 @@ def add_specific_rankings(
     week,
 ):
     """
-    Add player-specific FantasyPros ranking data to
-    players that already went through enrich_players().
+    Fully enrich shortlisted waiver candidates using
+    cached FantasyPros ranking data only.
 
-    This does NOT refetch projections or bulk ECR.
+    This function makes ZERO FantasyPros API requests.
+
+    Priority:
+        1. Bulk cached ROS consensus rankings
+        2. Existing individual-player ranking caches
     """
+
+    # --------------------------------------------------
+    # Group shortlisted players by position
+    # --------------------------------------------------
+
+    players_by_position = defaultdict(
+        list
+    )
 
     for player in players:
 
-        fp_id = player.get(
-            "fantasypros_id"
-        )
-
         position = player.get(
             "position"
+        )
+
+        fp_id = normalize_fp_id(
+            player.get(
+                "fantasypros_id"
+            )
         )
 
         if fp_id is None:
@@ -1387,219 +1500,126 @@ def add_specific_rankings(
         ):
             continue
 
-        try:
+        players_by_position[
+            position
+        ].append(
+            player
+        )
 
-            result = (
-                get_rankings_for_player(
-                    season=season,
-                    week=week,
-                    player_id=fp_id,
+    # --------------------------------------------------
+    # Try cached bulk ROS rankings first.
+    #
+    # IMPORTANT:
+    # This NEVER contacts FantasyPros.
+    # --------------------------------------------------
+
+    for (
+        position,
+        position_players,
+    ) in players_by_position.items():
+
+        result = (
+            get_cached_consensus_rankings(
+                season=season,
+                week=week,
+                position=position,
+                scoring="PPR",
+                ranking_type="ROS",
+            )
+        )
+
+        if not result:
+            continue
+
+        ros_lookup = {}
+
+        for ranked_player in (
+            result.get(
+                "players",
+                [],
+            )
+        ):
+
+            fp_id = normalize_fp_id(
+                ranked_player.get(
+                    "player_id"
                 )
             )
 
-            for ranked_player in (
-                result.get(
-                    "players",
-                    [],
+            if fp_id is None:
+                continue
+
+            ros_lookup[
+                fp_id
+            ] = ranked_player
+
+        for player in position_players:
+
+            fp_id = normalize_fp_id(
+                player.get(
+                    "fantasypros_id"
                 )
-            ):
-
-                ranked_id = normalize_fp_id(
-                    ranked_player.get(
-                        "id"
-                    )
-                )
-
-                normalized_fp_id = (
-                    normalize_fp_id(
-                        fp_id
-                    )
-                )
-
-                if (
-                    ranked_id
-                    != normalized_fp_id
-                ):
-                    continue
-
-                fp_position = (
-                    ranked_player.get(
-                        "position_id"
-                    )
-                )
-
-                rank = ranked_player.get(
-                    "rank",
-                    {},
-                )
-
-                ecr = rank.get(
-                    "ECR",
-                    {},
-                )
-
-                ecr_min = rank.get(
-                    "ECR_MIN",
-                    {},
-                )
-
-                ecr_max = rank.get(
-                    "ECR_MAX",
-                    {},
-                )
-
-                ecr_std = rank.get(
-                    "ECR_STD",
-                    {},
-                )
-
-                # --------------------------------------
-                # Weekly ECR fallback
-                # --------------------------------------
-
-                if player.get(
-                    "ecr"
-                ) is None:
-
-                    weekly_ecr = (
-                        ecr
-                        .get(
-                            "PPR",
-                            {},
-                        )
-                        .get(
-                            fp_position
-                        )
-                    )
-
-                    if weekly_ecr is not None:
-
-                        player[
-                            "ecr"
-                        ] = weekly_ecr
-
-                        player[
-                            "pos_rank"
-                        ] = (
-                            f"{fp_position}"
-                            f"{weekly_ecr}"
-                        )
-
-                        player[
-                            "rank_min"
-                        ] = (
-                            ecr_min
-                            .get(
-                                "PPR",
-                                {},
-                            )
-                            .get(
-                                fp_position
-                            )
-                        )
-
-                        player[
-                            "rank_max"
-                        ] = (
-                            ecr_max
-                            .get(
-                                "PPR",
-                                {},
-                            )
-                            .get(
-                                fp_position
-                            )
-                        )
-
-                        player[
-                            "rank_std"
-                        ] = (
-                            ecr_std
-                            .get(
-                                "PPR",
-                                {},
-                            )
-                            .get(
-                                fp_position
-                            )
-                        )
-
-                # --------------------------------------
-                # ROS
-                # --------------------------------------
-
-                ros_ecr = (
-                    ecr
-                    .get(
-                        "ROS-PPR",
-                        {},
-                    )
-                    .get(
-                        fp_position
-                    )
-                )
-
-                if ros_ecr is not None:
-
-                    player[
-                        "ros_ecr"
-                    ] = ros_ecr
-
-                    player[
-                        "ros_pos_rank"
-                    ] = (
-                        f"{fp_position}"
-                        f"{ros_ecr}"
-                    )
-
-                    player[
-                        "ros_min"
-                    ] = (
-                        ecr_min
-                        .get(
-                            "ROS-PPR",
-                            {},
-                        )
-                        .get(
-                            fp_position
-                        )
-                    )
-
-                    player[
-                        "ros_max"
-                    ] = (
-                        ecr_max
-                        .get(
-                            "ROS-PPR",
-                            {},
-                        )
-                        .get(
-                            fp_position
-                        )
-                    )
-
-                    player[
-                        "ros_std"
-                    ] = (
-                        ecr_std
-                        .get(
-                            "ROS-PPR",
-                            {},
-                        )
-                        .get(
-                            fp_position
-                        )
-                    )
-
-        except Exception as e:
-
-            print(
-                f"Could not get specific rankings "
-                f"for {player.get('name')}: "
-                f"{e}"
             )
 
-    # Rankings changed, so recalculate player values.
+            ranked_player = (
+                ros_lookup.get(
+                    fp_id
+                )
+            )
+
+            if ranked_player is None:
+                continue
+
+            player[
+                "ros_ecr"
+            ] = ranked_player.get(
+                "rank_ecr"
+            )
+
+            player[
+                "ros_pos_rank"
+            ] = ranked_player.get(
+                "pos_rank"
+            )
+
+            player[
+                "ros_min"
+            ] = ranked_player.get(
+                "rank_min"
+            )
+
+            player[
+                "ros_max"
+            ] = ranked_player.get(
+                "rank_max"
+            )
+
+            player[
+                "ros_std"
+            ] = ranked_player.get(
+                "rank_std"
+            )
+
+    # --------------------------------------------------
+    # Individual-player CACHE-ONLY fallback.
+    #
+    # This restores weekly/ROS values from caches we
+    # already created earlier without contacting the API.
+    # --------------------------------------------------
+
+    for player in players:
+
+        add_cached_ranking_fallback(
+            player=player,
+            season=season,
+            week=week,
+        )
+
+    # --------------------------------------------------
+    # Rankings/injury data may have changed player value,
+    # so calculate again.
+    # --------------------------------------------------
+
     add_player_values(
         players,
         current_week=week,

@@ -30,6 +30,10 @@ from week_status import (
     get_week_status,
 )
 
+from injury_monitor import (
+    attach_injury_signals,
+)
+
 
 SEASON = 2026
 
@@ -1094,6 +1098,7 @@ def main():
         season=SEASON,
         week=current_week,
         include_player_specific=False,
+        include_injuries=False,
     )
 
     # --------------------------------------------------
@@ -1108,6 +1113,33 @@ def main():
             per_position=5,
         )
     )
+
+    # --------------------------------------------------
+    # Add detailed injury/practice information only to
+    # the final waiver shortlist.
+    #
+    # This avoids making a large injury request for all
+    # 100 free agents.
+    # --------------------------------------------------
+
+    try:
+
+        waiver_candidates = (
+            attach_injury_signals(
+                players=waiver_candidates,
+                season=SEASON,
+                week=current_week,
+                include_news=False,
+                force_refresh=False,
+            )
+        )
+
+    except Exception as e:
+
+        print(
+            "Could not get waiver injury data: "
+            f"{e}"
+        )
 
     # --------------------------------------------------
     # Fully enrich only shortlisted waiver candidates
