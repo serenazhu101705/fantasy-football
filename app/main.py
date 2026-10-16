@@ -33,7 +33,9 @@ from week_status import (
 from injury_monitor import (
     attach_injury_signals,
 )
-
+from weekly_ml_update import (
+    maybe_run_weekly_ml_update,
+)
 
 SEASON = 2026
 
@@ -1018,6 +1020,15 @@ def print_waiver_advice(
 
 def main():
 
+    # ==================================================
+    # Weekly ML maintenance
+    #
+    # Cheap cache check on every startup.
+    # Full refresh/retrain only when a new completed
+    # fantasy week exists.
+    # ==================================================
+
+    maybe_run_weekly_ml_update()
     # --------------------------------------------------
     # Evaluate completed historical weeks
     #
@@ -1295,6 +1306,36 @@ def main():
             f"Week {current_week} "
             f"status."
         )
+    
+    # ==================================================
+    # Return structured application context
+    #
+    # main.py can still be run normally, but the
+    # chatbot can now reuse all of the data it loaded.
+    # ==================================================
+
+    return {
+        "league":
+            league,
+
+        "team":
+            my_team,
+
+        "current_week":
+            current_week,
+
+        "roster":
+            roster,
+
+        "waiver_candidates":
+            waiver_candidates,
+
+        "waiver_transactions":
+            ranked_waiver_transactions,
+
+        "optimized":
+            optimized,
+    }
 
 
 # ==================================================

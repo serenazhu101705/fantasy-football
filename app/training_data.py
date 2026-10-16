@@ -146,6 +146,7 @@ def should_use_cached_season(
 
 def load_raw_player_weeks(
     force_refresh=False,
+    force_refresh_current=False,
 ):
     """
     Load nflverse weekly player stats.
@@ -174,11 +175,22 @@ def load_raw_player_weeks(
             / f"player_stats_{season}.parquet"
         )
 
+        season_force_refresh = (
+            force_refresh
+            or (
+                force_refresh_current
+                and season
+                == CURRENT_SEASON
+            )
+        )
+
         use_cache = (
             should_use_cached_season(
                 cache_path=cache_path,
                 season=season,
-                force_refresh=force_refresh,
+                force_refresh=(
+                    season_force_refresh
+                ),
             )
         )
 
@@ -795,7 +807,9 @@ def add_dataset_split(
 # Final dataset
 # ==================================================
 
-def build_training_dataset():
+def build_training_dataset(
+    force_refresh_current=False,
+):
     """
     Build a leakage-safe player-week dataset.
 
@@ -809,7 +823,11 @@ def build_training_dataset():
     raw box-score statistics as feature columns.
     """
 
-    df = load_raw_player_weeks()
+    df = load_raw_player_weeks(
+        force_refresh_current=(
+            force_refresh_current
+        )
+    )
 
     df = standardize_columns(
         df
