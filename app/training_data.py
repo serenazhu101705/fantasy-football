@@ -4,6 +4,8 @@ import nflreadpy as nfl
 import pandas as pd
 import polars as pl
 
+import time
+
 
 # ==================================================
 # Configuration
@@ -32,6 +34,12 @@ OUTPUT_PATH = Path(
 RAW_CACHE_DIR = Path(
     "data/cache/nflverse"
 )
+
+CURRENT_SEASON = max(
+    SEASONS
+)
+
+CURRENT_SEASON_CACHE_TTL_HOURS = 24
 
 # ==================================================
 # Column helpers
@@ -79,6 +87,62 @@ def add_missing_numeric_column(
 # ==================================================
 # Load raw nflverse data
 # ==================================================
+def should_use_cached_season(
+    cache_path,
+    season,
+    force_refresh=False,
+):
+    """
+    Decide whether a cached nflverse season is fresh
+    enough to use.
+
+    Completed seasons:
+        cache forever
+
+    Current season:
+        refresh after 24 hours
+
+    force_refresh=True:
+        always refresh
+    """
+
+    if force_refresh:
+        return False
+
+    if not cache_path.exists():
+        return False
+
+    # ----------------------------------------------
+    # Completed seasons never change.
+    # ----------------------------------------------
+
+    if season < CURRENT_SEASON:
+        return True
+
+    # ----------------------------------------------
+    # Current season can change every week.
+    # Refresh once the cache is older than the TTL.
+    # ----------------------------------------------
+
+    modified_time = (
+        cache_path.stat().st_mtime
+    )
+
+    age_seconds = (
+        time.time()
+        - modified_time
+    )
+
+    ttl_seconds = (
+        CURRENT_SEASON_CACHE_TTL_HOURS
+        * 60
+        * 60
+    )
+
+    return (
+        age_seconds
+        < ttl_seconds
+    )
 
 def load_raw_player_weeks(
     force_refresh=False,
@@ -86,13 +150,14 @@ def load_raw_player_weeks(
     """
     Load nflverse weekly player stats.
 
-    Raw nflverse data is cached by season so we do not
-    repeatedly download multiple years while developing.
+    Cache policy:
 
-    Completed seasons can safely remain cached.
+        completed seasons -> cached forever
 
-    Use force_refresh=True when we intentionally want
-    fresh data, especially during the current season.
+        current season -> refreshed after
+                          24 hours
+
+        force_refresh=True -> refresh everything
     """
 
     RAW_CACHE_DIR.mkdir(
@@ -109,14 +174,19 @@ def load_raw_player_weeks(
             / f"player_stats_{season}.parquet"
         )
 
+        use_cache = (
+            should_use_cached_season(
+                cache_path=cache_path,
+                season=season,
+                force_refresh=force_refresh,
+            )
+        )
+
         # ------------------------------------------
-        # Use cache
+        # Fresh cache
         # ------------------------------------------
 
-        if (
-            cache_path.exists()
-            and not force_refresh
-        ):
+        if use_cache:
 
             print(
                 f"[CACHE] nflverse "
@@ -130,10 +200,24 @@ def load_raw_player_weeks(
             )
 
         # ------------------------------------------
-        # Download from nflverse
+        # Missing / stale cache
         # ------------------------------------------
 
         else:
+
+            if cache_path.exists():
+
+                print(
+                    f"[STALE] nflverse "
+                    f"player stats {season}"
+                )
+
+            else:
+
+                print(
+                    f"[MISS] nflverse "
+                    f"player stats {season}"
+                )
 
             print(
                 f"[API] nflverse "
@@ -171,9 +255,7 @@ def load_raw_player_weeks(
     )
 
     # ----------------------------------------------
-    # Convert to pandas for feature engineering
-    #
-    # to_dicts() avoids requiring pyarrow.
+    # Convert to pandas
     # ----------------------------------------------
 
     df = pd.DataFrame(
@@ -186,7 +268,6 @@ def load_raw_player_weeks(
     )
 
     return df
-
 # ==================================================
 # Standardize nflverse columns
 # ==================================================

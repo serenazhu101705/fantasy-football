@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import joblib
-import numpy as np
 import pandas as pd
 import polars as pl
 
@@ -75,9 +74,6 @@ TARGET = "target_ppr"
 def load_dataset():
     """
     Load our leakage-safe player-week dataset.
-
-    Use Polars first so we do not require pyarrow for
-    pandas.read_parquet().
     """
 
     if not DATASET_PATH.exists():
@@ -119,7 +115,7 @@ def calculate_metrics(
     """
     Standard regression metrics.
 
-    Lower is better for both.
+    Lower is better.
     """
 
     mae = mean_absolute_error(
@@ -164,101 +160,78 @@ def print_metrics(
 # Baselines
 # ==================================================
 
+def get_baseline_predictions(
+    df,
+):
+    """
+    Generate simple comparison predictions.
+
+    These are intentionally simple so the ML model
+    has meaningful baselines to beat.
+    """
+
+    return {
+        "Previous game":
+            df[
+                "prev_game_ppr"
+            ].fillna(
+                0.0
+            ),
+
+        "Last-3 average":
+            df[
+                "l3_ppr_avg"
+            ].fillna(
+                0.0
+            ),
+
+        "Season average":
+            df[
+                "season_ppr_avg"
+            ].fillna(
+                0.0
+            ),
+    }
+
+
 def evaluate_baselines(
     df,
     label,
 ):
     """
-    Compare against extremely simple forecasting
-    strategies.
-
-    A useful ML model should beat these.
+    Evaluate simple overall baselines.
     """
 
     actual = df[
         TARGET
     ]
 
+    predictions = (
+        get_baseline_predictions(
+            df
+        )
+    )
+
     print(
         f"\n=== {label} BASELINES ==="
     )
 
-    # --------------------------------------------------
-    # Baseline 1:
-    # predict exactly what the player scored last game
-    # --------------------------------------------------
+    results = {}
 
-    previous_game = (
-        df[
-            "prev_game_ppr"
-        ]
-        .fillna(
-            0.0
-        )
-    )
+    for (
+        name,
+        prediction,
+    ) in predictions.items():
 
-    previous_metrics = (
-        print_metrics(
-            "Previous game PPR",
+        results[
+            name
+        ] = print_metrics(
+            name,
             actual,
-            previous_game,
+            prediction,
         )
-    )
 
-    # --------------------------------------------------
-    # Baseline 2:
-    # last-three-game average
-    # --------------------------------------------------
-
-    last_three = (
-        df[
-            "l3_ppr_avg"
-        ]
-        .fillna(
-            0.0
-        )
-    )
-
-    last_three_metrics = (
-        print_metrics(
-            "Last-3 PPR average",
-            actual,
-            last_three,
-        )
-    )
-
-    # --------------------------------------------------
-    # Baseline 3:
-    # season-to-date average
-    # --------------------------------------------------
-
-    season_average = (
-        df[
-            "season_ppr_avg"
-        ]
-        .fillna(
-            0.0
-        )
-    )
-
-    season_metrics = (
-        print_metrics(
-            "Season PPR average",
-            actual,
-            season_average,
-        )
-    )
-
-    return {
-        "previous_game":
-            previous_metrics,
-
-        "last_three":
-            last_three_metrics,
-
-        "season_average":
-            season_metrics,
-    }
+    return results
 
 
 # ==================================================
@@ -267,12 +240,7 @@ def evaluate_baselines(
 
 def build_model():
     """
-    Version 1 learned model.
-
-    HistGradientBoostingRegressor is a good first model
-    for our tabular data because it can learn nonlinear
-    relationships and interactions without requiring a
-    neural network.
+    Version 1 learned weekly fantasy model.
     """
 
     preprocessor = ColumnTransformer(
@@ -322,7 +290,7 @@ def build_model():
 
 
 # ==================================================
-# Position-level diagnostics
+# Basic ML position metrics
 # ==================================================
 
 def print_position_metrics(
@@ -331,10 +299,7 @@ def print_position_metrics(
     label,
 ):
     """
-    A model can look good overall while being terrible
-    at one position.
-
-    Always inspect QB/RB/WR/TE separately.
+    Show ML MAE/RMSE by position.
     """
 
     result = df.copy()
@@ -344,7 +309,7 @@ def print_position_metrics(
     ] = predictions
 
     print(
-        f"\n=== {label} BY POSITION ==="
+        f"\n=== {label} ML BY POSITION ==="
     )
 
     for position in (
@@ -383,6 +348,249 @@ def print_position_metrics(
 
 
 # ==================================================
+# NEW:
+# Compare ML against baselines by position
+# ==================================================
+
+def compare_by_position(
+    df,
+    ml_predictions,
+    label,
+):
+    """
+    Compare the ML model against every baseline for
+    QB, RB, WR, and TE separately.
+
+    This tells us whether one universal model is
+    actually helping each position.
+
+    Positive ML vs Best % = ML is better.
+    Negative ML vs Best % = ML is worse.
+    """
+
+    result = df.copy()
+
+    result[
+        "ml_prediction"
+    ] = ml_predictions
+
+    print(
+        f"\n=== {label} MODEL VS BASELINES BY POSITION ==="
+    )
+
+    print(
+        f"{'POS':<5}"
+        f"{'N':>7}"
+        f"{'PREV':>10}"
+        f"{'L3':>10}"
+        f"{'SEASON':>10}"
+        f"{'ML':>10}"
+        f"{'BEST BASE':>15}"
+        f"{'ML vs BEST':>13}"
+    )
+
+    position_results = {}
+
+    for position in (
+        "QB",
+        "RB",
+        "WR",
+        "TE",
+    ):
+
+        position_df = result[
+            result[
+                "position"
+            ] == position
+        ].copy()
+
+        if len(
+            position_df
+        ) == 0:
+            continue
+
+        actual = position_df[
+            TARGET
+        ]
+
+        # ------------------------------------------
+        # Baseline MAEs
+        # ------------------------------------------
+
+        previous_mae = (
+            mean_absolute_error(
+                actual,
+                position_df[
+                    "prev_game_ppr"
+                ].fillna(
+                    0.0
+                ),
+            )
+        )
+
+        last_three_mae = (
+            mean_absolute_error(
+                actual,
+                position_df[
+                    "l3_ppr_avg"
+                ].fillna(
+                    0.0
+                ),
+            )
+        )
+
+        season_mae = (
+            mean_absolute_error(
+                actual,
+                position_df[
+                    "season_ppr_avg"
+                ].fillna(
+                    0.0
+                ),
+            )
+        )
+
+        ml_mae = (
+            mean_absolute_error(
+                actual,
+                position_df[
+                    "ml_prediction"
+                ],
+            )
+        )
+
+        # ------------------------------------------
+        # Find strongest simple baseline
+        # ------------------------------------------
+
+        baseline_maes = {
+            "PREV": previous_mae,
+            "L3": last_three_mae,
+            "SEASON": season_mae,
+        }
+
+        best_baseline_name = min(
+            baseline_maes,
+            key=baseline_maes.get,
+        )
+
+        best_baseline_mae = (
+            baseline_maes[
+                best_baseline_name
+            ]
+        )
+
+        # Positive = ML is better.
+        improvement = (
+            best_baseline_mae
+            - ml_mae
+        )
+
+        improvement_pct = (
+            (
+                improvement
+                / best_baseline_mae
+            )
+            * 100.0
+            if best_baseline_mae > 0
+            else 0.0
+        )
+
+        position_results[
+            position
+        ] = {
+            "n":
+                len(
+                    position_df
+                ),
+
+            "previous_mae":
+                previous_mae,
+
+            "last_three_mae":
+                last_three_mae,
+
+            "season_mae":
+                season_mae,
+
+            "ml_mae":
+                ml_mae,
+
+            "best_baseline":
+                best_baseline_name,
+
+            "best_baseline_mae":
+                best_baseline_mae,
+
+            "improvement":
+                improvement,
+
+            "improvement_pct":
+                improvement_pct,
+        }
+
+        best_text = (
+            f"{best_baseline_name} "
+            f"{best_baseline_mae:.3f}"
+        )
+
+        improvement_text = (
+            f"{improvement_pct:+.2f}%"
+        )
+
+        print(
+            f"{position:<5}"
+            f"{len(position_df):>7,}"
+            f"{previous_mae:>10.3f}"
+            f"{last_three_mae:>10.3f}"
+            f"{season_mae:>10.3f}"
+            f"{ml_mae:>10.3f}"
+            f"{best_text:>15}"
+            f"{improvement_text:>13}"
+        )
+
+    # ----------------------------------------------
+    # Position conclusions
+    # ----------------------------------------------
+
+    print(
+        f"\n=== {label} POSITION VERDICTS ==="
+    )
+
+    for (
+        position,
+        metrics,
+    ) in position_results.items():
+
+        improvement_pct = (
+            metrics[
+                "improvement_pct"
+            ]
+        )
+
+        if improvement_pct > 1.0:
+
+            verdict = "PASS"
+
+        elif improvement_pct >= -1.0:
+
+            verdict = "TIE"
+
+        else:
+
+            verdict = "FAIL"
+
+        print(
+            f"{position}: "
+            f"{verdict} "
+            f"({improvement_pct:+.2f}% "
+            f"vs best simple baseline)"
+        )
+
+    return position_results
+
+
+# ==================================================
 # Example predictions
 # ==================================================
 
@@ -392,8 +600,7 @@ def print_prediction_examples(
     count=20,
 ):
     """
-    Inspect some actual predictions rather than relying
-    only on aggregate metrics.
+    Inspect recent 2026 predictions.
     """
 
     result = df.copy()
@@ -429,8 +636,6 @@ def print_prediction_examples(
         "\n=== SAMPLE 2026 PREDICTIONS ==="
     )
 
-    # Use the most recent rows rather than random rows
-    # so the output is easier to reason about.
     examples = (
         result[
             columns
@@ -464,7 +669,7 @@ def print_prediction_examples(
 
 
 # ==================================================
-# Train
+# Main
 # ==================================================
 
 def main():
@@ -513,7 +718,7 @@ def main():
     )
 
     # ==================================================
-    # Baselines
+    # Overall baselines
     # ==================================================
 
     validation_baselines = (
@@ -531,10 +736,9 @@ def main():
     )
 
     # ==================================================
-    # Stage 1
-    #
-    # Train using 2021-2024.
-    # Evaluate on completely unseen 2025.
+    # Stage 1:
+    # Train 2021-2024
+    # Validate on 2025
     # ==================================================
 
     print(
@@ -543,14 +747,14 @@ def main():
 
     validation_model = build_model()
 
-    validation_features = (
+    model_features = (
         NUMERIC_FEATURES
         + CATEGORICAL_FEATURES
     )
 
     validation_model.fit(
         train_df[
-            validation_features
+            model_features
         ],
         train_df[
             TARGET
@@ -560,7 +764,7 @@ def main():
     validation_predictions = (
         validation_model.predict(
             validation_df[
-                validation_features
+                model_features
             ]
         )
     )
@@ -585,15 +789,18 @@ def main():
         "2025 VALIDATION",
     )
 
+    validation_position_results = (
+        compare_by_position(
+            validation_df,
+            validation_predictions,
+            "2025 VALIDATION",
+        )
+    )
+
     # ==================================================
-    # Stage 2
-    #
-    # Once validation is complete, retrain using every
-    # completed season:
-    #
-    # 2021-2025
-    #
-    # Then evaluate on unseen 2026.
+    # Stage 2:
+    # Train 2021-2025
+    # Test on unseen 2026
     # ==================================================
 
     print(
@@ -610,7 +817,7 @@ def main():
 
     final_model.fit(
         final_training_df[
-            validation_features
+            model_features
         ],
         final_training_df[
             TARGET
@@ -620,7 +827,7 @@ def main():
     test_predictions = (
         final_model.predict(
             test_df[
-                validation_features
+                model_features
             ]
         )
     )
@@ -645,19 +852,41 @@ def main():
         "2026 TEST",
     )
 
+    test_position_results = (
+        compare_by_position(
+            test_df,
+            test_predictions,
+            "2026 TEST",
+        )
+    )
+
     # ==================================================
-    # Direct comparison
+    # Overall comparison against BEST simple baseline
     # ==================================================
 
     print(
-        "\n=== MODEL VS BASELINE ==="
+        "\n=== OVERALL MODEL VS BEST BASELINE ==="
     )
 
-    baseline_mae = (
-        test_baselines[
-            "last_three"
-        ][
-            "mae"
+    overall_baselines = {
+        name:
+            metrics[
+                "mae"
+            ]
+        for (
+            name,
+            metrics,
+        ) in test_baselines.items()
+    }
+
+    best_baseline_name = min(
+        overall_baselines,
+        key=overall_baselines.get,
+    )
+
+    best_baseline_mae = (
+        overall_baselines[
+            best_baseline_name
         ]
     )
 
@@ -668,57 +897,57 @@ def main():
     )
 
     improvement = (
-        baseline_mae
+        best_baseline_mae
         - ml_mae
     )
 
     improvement_pct = (
         (
             improvement
-            / baseline_mae
+            / best_baseline_mae
         )
         * 100.0
-        if baseline_mae > 0
+        if best_baseline_mae > 0
         else 0.0
     )
 
     print(
-        f"Last-3 baseline MAE: "
-        f"{baseline_mae:.3f}"
+        f"Best baseline:        "
+        f"{best_baseline_name}"
     )
 
     print(
-        f"ML model MAE:        "
+        f"Best baseline MAE:    "
+        f"{best_baseline_mae:.3f}"
+    )
+
+    print(
+        f"ML model MAE:         "
         f"{ml_mae:.3f}"
     )
 
     print(
-        f"MAE improvement:     "
+        f"MAE improvement:      "
         f"{improvement:+.3f}"
     )
 
     print(
-        f"Percent improvement: "
+        f"Percent improvement:  "
         f"{improvement_pct:+.2f}%"
     )
 
-    if ml_mae < baseline_mae:
+    if ml_mae < best_baseline_mae:
 
         print(
-            "\nPASS: ML beats the "
-            "last-3 PPR baseline."
+            "\nPASS: ML beats the strongest "
+            "overall simple baseline."
         )
 
     else:
 
         print(
-            "\nFAIL: ML does not yet beat the "
-            "last-3 PPR baseline."
-        )
-
-        print(
-            "We should improve the model/features "
-            "before using it in live decisions."
+            "\nFAIL: ML does not beat the strongest "
+            "overall simple baseline."
         )
 
     # ==================================================
@@ -769,6 +998,12 @@ def main():
 
         "test_metrics":
             test_ml_metrics,
+
+        "validation_position_metrics":
+            validation_position_results,
+
+        "test_position_metrics":
+            test_position_results,
     }
 
     joblib.dump(
