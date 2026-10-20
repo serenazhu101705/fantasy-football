@@ -21,6 +21,7 @@ from player_value import add_player_values
 from matchup_context import get_matchup_context
 from shadow_predictor import get_shadow_prediction
 from free_fantasy_sources import get_free_fallback_signals
+from actual_performance import get_actual_performance
 
 
 # ==================================================
@@ -83,7 +84,9 @@ Decision philosophy:
   matter more than a modest matchup difference.
 
 Provider rules:
-- FantasyPros ECR/projections remain primary when present.
+- FantasyPros ECR/projections are useful expert/forecast evidence when present, but they are not required for Claude to make a decision when strong factual fallback evidence exists.
+- actual_performance comes from nflverse completed-game statistics and is factual, independent of FantasyPros, and should be used heavily for role, volume, production, and trend analysis.
+- When FantasyPros is missing or rate-limited, do NOT treat the player as unevaluable. Synthesize actual_performance + ESPN + Sleeper + FantasyCalc + LeagueLogs + matchup + shadow ML as available, and lower confidence appropriately.
 - FantasyCalc is a FREE market-derived redraft value/rank based on real trades.
   Treat it as an independent ROS/market signal. It is NOT FantasyPros ECR and
   is NOT a weekly projection.
@@ -183,6 +186,22 @@ def _free_fallback_context(player):
                 "source": "Sleeper",
                 "reason": str(exc),
             },
+        }
+
+
+def _actual_performance_context(player):
+    """Completed-game nflverse evidence, independent of FantasyPros."""
+    try:
+        return get_actual_performance(
+            player,
+            season=SEASON,
+            week=_current_week(),
+        )
+    except Exception as exc:
+        return {
+            "available": False,
+            "source": "nflverse",
+            "reason": str(exc),
         }
 
 
@@ -601,6 +620,7 @@ def compact_player(
     include_shadow=True,
     include_matchup=True,
     include_free=True,
+    include_actual=True,
 ):
     if not player:
         return None
@@ -657,6 +677,11 @@ def compact_player(
         "ros_missing_data": player.get("ros_missing_data") or None,
     })
 
+    # Factual completed-game evidence is intentionally separate from projections
+    # and rankings so Claude can still evaluate a player when FantasyPros fails.
+    if include_actual:
+        result["actual_performance"] = _actual_performance_context(player)
+
     if include_matchup:
         result["matchup"] = get_matchup_context(
             player,
@@ -707,6 +732,7 @@ def _comparison_player(player, include_shadow=False):
         "weekly_missing_data",
         "ros_data_complete",
         "ros_missing_data",
+        "actual_performance",
         "matchup",
         "ml_shadow",
         "free_fallback",
@@ -727,6 +753,13 @@ def _fallback_available(player_context, source):
     )
 
 
+def _actual_stats_available(player_context):
+    return bool(
+        (player_context.get("actual_performance") or {})
+        .get("available")
+    )
+
+
 def _comparison_status(first_context, second_context, mode):
     if mode == "weekly":
         primary_complete = bool(first_context.get("weekly_data_complete")) and bool(
@@ -741,7 +774,10 @@ def _comparison_status(first_context, second_context, mode):
         fantasycalc_support = _fallback_available(first_context, "fantasycalc") and _fallback_available(
             second_context, "fantasycalc"
         )
-        if sleeper_support or fantasycalc_support:
+        actual_stats_support = _actual_stats_available(first_context) and _actual_stats_available(
+            second_context
+        )
+        if actual_stats_support or sleeper_support or fantasycalc_support:
             return "FALLBACK_SUPPORTED"
         return "INCOMPLETE_DATA"
 
@@ -751,10 +787,16 @@ def _comparison_status(first_context, second_context, mode):
     if primary_complete:
         return "COMPLETE_PRIMARY_DATA"
 
-    # FantasyCalc is a strong independent ROS/market signal, but it is not ECR.
-    if _fallback_available(first_context, "fantasycalc") and _fallback_available(
+    # A ROS recommendation can still be supported by factual player performance
+    # plus independent market/health evidence even when FantasyPros ROS ECR is
+    # missing. FantasyCalc remains market value, not ECR.
+    actual_stats_support = _actual_stats_available(first_context) and _actual_stats_available(
+        second_context
+    )
+    fantasycalc_support = _fallback_available(first_context, "fantasycalc") and _fallback_available(
         second_context, "fantasycalc"
-    ):
+    )
+    if actual_stats_support or fantasycalc_support:
         return "FALLBACK_SUPPORTED"
 
     return "INCOMPLETE_DATA"
@@ -803,6 +845,7 @@ def tool_get_roster():
                 include_shadow=False,
                 include_matchup=False,
                 include_free=False,
+                include_actual=False,
             )
             for p in roster
         ],
@@ -858,9 +901,11 @@ def tool_compare_players_weekly(player_a, player_b):
         "player_b": second_context,
         "advisory_score_comparison": advisory,
         "decision_instruction": (
-            "Make the final start/sit judgment from the supplied evidence. "
-            "The deterministic score comparison is advisory only. If it is "
-            "suppressed, do not reconstruct a winner from an incomplete score."
+            "Make the final start/sit judgment from the supplied evidence, including "
+            "actual_performance from completed nflverse games. The deterministic score "
+            "comparison is advisory only. If FantasyPros is missing, use actual role, "
+            "volume, production, health, ESPN, market, matchup, and ML evidence rather "
+            "than treating the player as unevaluable."
         ),
     }
 
@@ -897,11 +942,11 @@ def tool_compare_players_ros(player_a, player_b):
         "player_b": second_context,
         "advisory_score_comparison": advisory,
         "decision_instruction": (
-            "Make the final ROS/trade judgment from the evidence. FantasyCalc "
-            "may support a recommendation when FantasyPros ROS ECR is missing, "
-            "but FantasyCalc is market value, not ECR. The deterministic ROS "
-            "score is advisory and is intentionally suppressed unless primary "
-            "ROS inputs are complete for both players."
+            "Make the final ROS/trade judgment from the evidence. When FantasyPros "
+            "ROS ECR is missing, actual_performance provides factual production/role "
+            "evidence and FantasyCalc provides market evidence; neither should be called "
+            "ECR. The deterministic ROS score is advisory and is intentionally suppressed "
+            "unless primary ROS inputs are complete for both players."
         ),
     }
 
@@ -916,7 +961,7 @@ def tool_get_optimal_lineup():
             str(slot): (
                 None
                 if player is None
-                else compact_player(player, include_shadow=False, include_matchup=False, include_free=False)
+                else compact_player(player, include_shadow=False, include_matchup=False, include_free=False, include_actual=False)
             )
             for slot, player in lineup.items()
         },
@@ -948,8 +993,8 @@ def tool_get_waiver_recommendations():
 
         moves.append(_non_none({
             "category": category,
-            "add": compact_player(add_player, include_shadow=False, include_matchup=False, include_free=False),
-            "drop": compact_player(drop_player, include_shadow=False, include_matchup=False, include_free=False) if drop_player else None,
+            "add": compact_player(add_player, include_shadow=False, include_matchup=False, include_free=False, include_actual=False),
+            "drop": compact_player(drop_player, include_shadow=False, include_matchup=False, include_free=False, include_actual=False) if drop_player else None,
             "weekly_lineup_delta": transaction.get("weekly_lineup_delta"),
             "projected_points_delta": transaction.get("projected_points_delta"),
             "ros_delta": transaction.get("ros_delta"),
@@ -967,7 +1012,7 @@ def tool_get_waiver_recommendations():
             "recommendation": "NO_MOVE",
             "moves": [],
             "top_loaded_candidates": [
-                compact_player(p, include_shadow=False, include_matchup=False, include_free=False)
+                compact_player(p, include_shadow=False, include_matchup=False, include_free=False, include_actual=False)
                 for p in candidates[:8]
             ],
         }
@@ -1020,6 +1065,7 @@ def tool_get_system_status():
             "claude_role": "final contextual judgment",
         },
         "free_fallbacks": {
+            "nflverse_actual_performance": "completed-game production/usage/trends; independent of FantasyPros",
             "fantasycalc": "redraft market value/rank; not ECR or projection",
             "sleeper": "player/injury/practice/depth-chart metadata",
         },
@@ -1048,9 +1094,9 @@ TOOLS = [
     {
         "name": "get_player_details",
         "description": (
-            "Get current data for any NFL fantasy player. If the player is not "
-            "already loaded, the app attempts an ESPN league-wide lookup and "
-            "enriches that player."
+            "Get current data for any NFL fantasy player, including completed-game "
+            "nflverse actual-performance stats. If the player is not already loaded, "
+            "the app attempts an ESPN league-wide lookup and enriches that player."
         ),
         "input_schema": {
             "type": "object",
@@ -1064,9 +1110,9 @@ TOOLS = [
     {
         "name": "compare_players_weekly",
         "description": (
-            "Compare two players for this week's start/sit decision. Returns "
-            "primary data, matchup, free fallback evidence, shadow ML, and an "
-            "advisory deterministic score comparison when primary data is complete."
+            "Compare two players for this week's start/sit decision using actual "
+            "completed-game nflverse performance, projections/rankings when available, "
+            "health, matchup, free fallback evidence, shadow ML, and an advisory score."
         ),
         "input_schema": {
             "type": "object",
@@ -1081,9 +1127,9 @@ TOOLS = [
     {
         "name": "compare_players_ros",
         "description": (
-            "Compare two players rest of season / for a trade. Includes "
-            "FantasyCalc free market-value fallback when FantasyPros ROS data "
-            "is missing. Deterministic ROS score is advisory only."
+            "Compare two players rest of season / for a trade using actual completed-game "
+            "nflverse performance plus FantasyPros when available and FantasyCalc, "
+            "Sleeper, and LeagueLogs fallback evidence. Deterministic ROS score is advisory."
         ),
         "input_schema": {
             "type": "object",
@@ -1156,6 +1202,9 @@ def select_tools_for_message(user_message):
 
     if any(term in text for term in ("ml", "model", "predict", "prediction", "shadow")):
         return pick("get_shadow_prediction", "get_player_details")
+
+    if any(term in text for term in ("actual stats", "actual data", "stats", "statistics", "fallback data", "fallback", "usage", "targets", "carries", "production")):
+        return pick("get_player_details")
 
     if any(term in text for term in ("rest of season", "ros", "trade", "keeper", "long term", "longterm")):
         return pick("compare_players_ros", "get_player_details")
