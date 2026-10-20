@@ -63,6 +63,38 @@ def normalize_fp_id(
         ).strip()
 
 
+def select_projection_for_scoring(player, reception_points=1.0):
+    """Choose the FantasyPros projection matching ESPN reception scoring.
+
+    FantasyPros projection rows already expose standard, half-PPR, and PPR
+    point totals. For unusual custom reception values, linearly interpolate
+    between standard and full-PPR using receptions as the only scoring change.
+    """
+    try:
+        rp = float(reception_points)
+    except (TypeError, ValueError):
+        rp = 1.0
+
+    std = player.get("fp_std")
+    half = player.get("fp_half")
+    ppr = player.get("fp_ppr")
+
+    if abs(rp) < 1e-9:
+        return std
+    if abs(rp - 0.5) < 1e-9:
+        return half if half is not None else std
+    if abs(rp - 1.0) < 1e-9:
+        return ppr if ppr is not None else half if half is not None else std
+
+    try:
+        if std is not None and ppr is not None:
+            return float(std) + rp * (float(ppr) - float(std))
+    except (TypeError, ValueError):
+        pass
+
+    return ppr if ppr is not None else half if half is not None else std
+
+
 # ==================================================
 # Name / team matching helpers
 # ==================================================
@@ -279,6 +311,7 @@ def add_cached_ranking_fallback(
     player,
     season,
     week,
+    scoring="PPR",
 ):
     """
     Fill missing weekly and ROS FantasyPros rankings
@@ -304,6 +337,11 @@ def add_cached_ranking_fallback(
 
     if not result:
         return player
+
+    scoring_key = str(scoring or "PPR").upper()
+    if scoring_key not in {"STD", "HALF", "PPR"}:
+        scoring_key = "PPR"
+    ros_scoring_key = f"ROS-{scoring_key}"
 
     for ranked_player in (
         result.get(
@@ -361,7 +399,7 @@ def add_cached_ranking_fallback(
             weekly_ecr = (
                 ecr
                 .get(
-                    "PPR",
+                    scoring_key,
                     {},
                 )
                 .get(
@@ -387,7 +425,7 @@ def add_cached_ranking_fallback(
                 ] = (
                     ecr_min
                     .get(
-                        "PPR",
+                        scoring_key,
                         {},
                     )
                     .get(
@@ -400,7 +438,7 @@ def add_cached_ranking_fallback(
                 ] = (
                     ecr_max
                     .get(
-                        "PPR",
+                        scoring_key,
                         {},
                     )
                     .get(
@@ -413,7 +451,7 @@ def add_cached_ranking_fallback(
                 ] = (
                     ecr_std
                     .get(
-                        "PPR",
+                        scoring_key,
                         {},
                     )
                     .get(
@@ -432,7 +470,7 @@ def add_cached_ranking_fallback(
             ros_ecr = (
                 ecr
                 .get(
-                    "ROS-PPR",
+                    ros_scoring_key,
                     {},
                 )
                 .get(
@@ -458,7 +496,7 @@ def add_cached_ranking_fallback(
                 ] = (
                     ecr_min
                     .get(
-                        "ROS-PPR",
+                        ros_scoring_key,
                         {},
                     )
                     .get(
@@ -471,7 +509,7 @@ def add_cached_ranking_fallback(
                 ] = (
                     ecr_max
                     .get(
-                        "ROS-PPR",
+                        ros_scoring_key,
                         {},
                     )
                     .get(
@@ -484,7 +522,7 @@ def add_cached_ranking_fallback(
                 ] = (
                     ecr_std
                     .get(
-                        "ROS-PPR",
+                        ros_scoring_key,
                         {},
                     )
                     .get(
@@ -502,6 +540,8 @@ def enrich_players(
     week,
     include_player_specific=True,
     include_injuries=True,
+    scoring="PPR",
+    reception_points=1.0,
 ):
     """
     Take raw ESPN players and attach:
@@ -725,7 +765,7 @@ def enrich_players(
                     season=season,
                     week=week,
                     position=position,
-                    scoring="PPR",
+                    scoring=scoring,
                 )
             )
 
@@ -834,7 +874,7 @@ def enrich_players(
                         season=season,
                         week=week,
                         position=position,
-                        scoring="PPR",
+                        scoring=scoring,
                         ranking_type="ROS",
                     )
                 )
@@ -1106,6 +1146,18 @@ def enrich_players(
                 ] = None
 
     # ==================================================
+    # Select projection for this ESPN league scoring format
+    # ==================================================
+
+    for player in players:
+        player["league_reception_points"] = reception_points
+        player["league_scoring_format"] = scoring
+        player["fp_points"] = select_projection_for_scoring(
+            player,
+            reception_points=reception_points,
+        )
+
+    # ==================================================
     # Attach weekly ECR
     # ==================================================
 
@@ -1291,6 +1343,7 @@ def enrich_players(
                 player=player,
                 season=season,
                 week=week,
+                scoring=scoring,
             )
     # ==================================================
     # Recent NFL usage
@@ -1323,6 +1376,7 @@ def enrich_players(
                 ),
                 current_week=week,
                 last_n=3,
+                reception_points=reception_points,
             )
 
         except Exception as e:
@@ -1457,6 +1511,7 @@ def add_specific_rankings(
     players,
     season,
     week,
+    scoring="PPR",
 ):
     """
     Fully enrich shortlisted waiver candidates using
@@ -1523,7 +1578,7 @@ def add_specific_rankings(
                 season=season,
                 week=week,
                 position=position,
-                scoring="PPR",
+                scoring=scoring,
                 ranking_type="ROS",
             )
         )
@@ -1613,6 +1668,7 @@ def add_specific_rankings(
             player=player,
             season=season,
             week=week,
+            scoring=scoring,
         )
 
     # --------------------------------------------------

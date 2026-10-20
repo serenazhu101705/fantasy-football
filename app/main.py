@@ -36,6 +36,10 @@ from injury_monitor import (
 from weekly_ml_update import (
     maybe_run_weekly_ml_update,
 )
+from league_settings import (
+    get_league_scoring_context,
+    reception_points_or_default,
+)
 
 SEASON = 2026
 
@@ -63,7 +67,7 @@ def print_roster(
         f"{'ROS':>7} "
         f"{'WK VAL':>7} "
         f"{'ROS VAL':>8} "
-        f"{'L3 PPR':>8} "
+        f"{'L3 PTS':>8} "
         f"{'OPP':>9} "
         f"{'STATUS':>18}"
     )
@@ -74,8 +78,10 @@ def print_roster(
         # Weekly projection
         # ------------------------------------------
 
-        projection = player.get(
-            "fp_ppr"
+        projection = (
+            player.get("fp_points")
+            if player.get("fp_points") is not None
+            else player.get("fp_ppr")
         )
 
         proj_text = (
@@ -154,14 +160,18 @@ def print_roster(
 
         if (
             usage is not None
-            and usage.get(
-                "ppr_points_per_game"
-            ) is not None
+            and (
+                usage.get("fantasy_points_per_game") is not None
+                or usage.get("ppr_points_per_game") is not None
+            )
         ):
 
-            recent_ppr = (
-                f"{usage['ppr_points_per_game']:.2f}"
+            recent_value = (
+                usage.get("fantasy_points_per_game")
+                if usage.get("fantasy_points_per_game") is not None
+                else usage.get("ppr_points_per_game")
             )
+            recent_ppr = f"{recent_value:.2f}"
 
         else:
 
@@ -289,8 +299,10 @@ def print_optimal_lineup(
 
             continue
 
-        projection = player.get(
-            "fp_ppr"
+        projection = (
+            player.get("fp_points")
+            if player.get("fp_points") is not None
+            else player.get("fp_ppr")
         )
 
         weekly_score = player.get(
@@ -566,7 +578,7 @@ def print_waiver_candidates(
         f"{'WK DATA':>8} "
         f"{'ROS VAL':>8} "
         f"{'ROS DATA':>9} "
-        f"{'L3 PPR':>8}"
+        f"{'L3 PTS':>8}"
     )
 
     position_order = {
@@ -600,8 +612,10 @@ def print_waiver_candidates(
         # Projection
         # ------------------------------------------
 
-        projection = player.get(
-            "fp_ppr"
+        projection = (
+            player.get("fp_points")
+            if player.get("fp_points") is not None
+            else player.get("fp_ppr")
         )
 
         projection_text = (
@@ -720,9 +734,9 @@ def print_waiver_candidates(
         )
 
         recent_ppr = (
-            usage.get(
-                "ppr_points_per_game"
-            )
+            usage.get("fantasy_points_per_game")
+            if usage.get("fantasy_points_per_game") is not None
+            else usage.get("ppr_points_per_game")
         )
 
         recent_text = (
@@ -1051,6 +1065,14 @@ def main():
     )
 
     # --------------------------------------------------
+    # Authoritative league scoring context from ESPN
+    # --------------------------------------------------
+
+    league_settings = get_league_scoring_context(league)
+    reception_points = reception_points_or_default(league_settings)
+    fantasypros_scoring = league_settings.get("fantasypros_scoring", "PPR")
+
+    # --------------------------------------------------
     # Get my ESPN team
     # --------------------------------------------------
 
@@ -1079,6 +1101,8 @@ def main():
         players=roster,
         season=SEASON,
         week=current_week,
+        scoring=fantasypros_scoring,
+        reception_points=reception_points,
     )
 
     # --------------------------------------------------
@@ -1110,6 +1134,8 @@ def main():
         week=current_week,
         include_player_specific=False,
         include_injuries=False,
+        scoring=fantasypros_scoring,
+        reception_points=reception_points,
     )
 
     # --------------------------------------------------
@@ -1164,6 +1190,7 @@ def main():
             players=waiver_candidates,
             season=SEASON,
             week=current_week,
+            scoring=fantasypros_scoring,
         )
     )
 
@@ -1196,6 +1223,12 @@ def main():
     print(
         f"Week: "
         f"{current_week}"
+    )
+
+    print(
+        "Scoring: "
+        f"{league_settings.get('scoring_label')} "
+        f"({league_settings.get('reception_points')} pts/reception)"
     )
 
     # --------------------------------------------------
@@ -1323,6 +1356,9 @@ def main():
 
         "current_week":
             current_week,
+
+        "league_settings":
+            league_settings,
 
         "roster":
             roster,

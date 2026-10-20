@@ -73,7 +73,7 @@ def get_recent_player_stats(player_name, current_week, last_n=3):
     )
 
 
-def get_recent_usage(player_name, current_week, last_n=3):
+def get_recent_usage(player_name, current_week, last_n=3, reception_points=1.0):
     """
     Return useful averages/totals over the player's last N games.
     """
@@ -86,6 +86,25 @@ def get_recent_usage(player_name, current_week, last_n=3):
 
     if df.height == 0:
         return None
+
+    try:
+        rp = float(reception_points)
+    except (TypeError, ValueError):
+        rp = 1.0
+
+    # nflverse exposes standard and PPR fantasy points. Derive the current
+    # league's reception scoring from standard + receptions * points/catch.
+    if "fantasy_points" in df.columns:
+        league_points = (
+            pl.col("fantasy_points").fill_null(0.0)
+            + pl.col("receptions").fill_null(0.0) * rp
+        )
+    else:
+        league_points = (
+            pl.col("fantasy_points_ppr").fill_null(0.0)
+            - pl.col("receptions").fill_null(0.0)
+            + pl.col("receptions").fill_null(0.0) * rp
+        )
 
     summary = df.select(
         pl.len().alias("games"),
@@ -100,13 +119,18 @@ def get_recent_usage(player_name, current_week, last_n=3):
         pl.col("rushing_tds").sum().alias("rushing_tds"),
         pl.col("receiving_tds").sum().alias("receiving_tds"),
 
-        pl.col("fantasy_points_ppr").mean().alias("ppr_points_per_game"),
+        league_points.mean().alias("fantasy_points_per_game"),
+        pl.lit(rp).alias("reception_points"),
 
         pl.col("target_share").mean().alias("target_share"),
         pl.col("air_yards_share").mean().alias("air_yards_share"),
     )
 
-    return summary.to_dicts()[0]
+    result = summary.to_dicts()[0]
+    # Backward-compatible alias for old callers. New code should use
+    # fantasy_points_per_game because the league may not be full PPR.
+    result["ppr_points_per_game"] = result.get("fantasy_points_per_game")
+    return result
 
 @lru_cache(maxsize=1)
 def get_schedule():

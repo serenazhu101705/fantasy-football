@@ -18,6 +18,21 @@ def _safe_float(
         return default
 
 
+def _weekly_projection(player):
+    value = player.get("fp_points")
+    if value is None:
+        value = player.get("fp_ppr")
+    return value
+
+
+def _recent_fantasy_points(player):
+    usage = player.get("recent_usage") or {}
+    value = usage.get("fantasy_points_per_game")
+    if value is None:
+        value = usage.get("ppr_points_per_game")
+    return value
+
+
 def _rank_score(rank):
     """
     Convert positional rank into a 0-1 score.
@@ -175,9 +190,7 @@ def get_weekly_data_quality(
         "D/ST",
     ):
 
-        if player.get(
-            "fp_ppr"
-        ) is None:
+        if _weekly_projection(player) is None:
 
             missing.append(
                 "weekly_projection"
@@ -215,9 +228,7 @@ def get_weekly_data_quality(
     # Offensive players
     # --------------------------------------------------
 
-    if player.get(
-        "fp_ppr"
-    ) is None:
+    if _weekly_projection(player) is None:
 
         missing.append(
             "weekly_projection"
@@ -238,12 +249,10 @@ def get_weekly_data_quality(
         or {}
     )
 
-    if usage.get(
-        "ppr_points_per_game"
-    ) is None:
+    if _recent_fantasy_points(player) is None:
 
         missing.append(
-            "recent_ppr"
+            "recent_fantasy_points"
         )
 
     # Opportunity is currently part of the RB/WR/TE
@@ -359,12 +368,10 @@ def get_ros_data_quality(
         or {}
     )
 
-    if usage.get(
-        "ppr_points_per_game"
-    ) is None:
+    if _recent_fantasy_points(player) is None:
 
         missing.append(
-            "recent_ppr"
+            "recent_fantasy_points"
         )
 
     if position == "RB":
@@ -413,7 +420,7 @@ def calculate_base_weekly_score(
 
         50% weekly projection
         20% weekly ECR
-        20% recent PPR
+        20% recent fantasy points
         10% recent opportunity
 
     Missing inputs contribute zero.
@@ -435,9 +442,7 @@ def calculate_base_weekly_score(
     ):
 
         return _safe_float(
-            player.get(
-                "fp_ppr"
-            )
+            _weekly_projection(player)
         )
 
     # ----------------------------------------------
@@ -445,9 +450,7 @@ def calculate_base_weekly_score(
     # ----------------------------------------------
 
     projection = _normalize_points(
-        player.get(
-            "fp_ppr"
-        )
+        _weekly_projection(player)
     )
 
     ecr = _rank_score(
@@ -464,9 +467,7 @@ def calculate_base_weekly_score(
     )
 
     recent = _normalize_points(
-        usage.get(
-            "ppr_points_per_game"
-        )
+        _recent_fantasy_points(player)
     )
 
     opportunity = (
@@ -515,7 +516,7 @@ def calculate_base_ros_score(
 
         50% FantasyPros ROS ECR
         20% LeagueLogs ROS positional rank
-        20% recent PPR production
+        20% recent fantasy points production
         10% recent opportunity
 
     Missing inputs contribute zero.
@@ -573,9 +574,7 @@ def calculate_base_ros_score(
     )
 
     recent = _normalize_points(
-        usage.get(
-            "ppr_points_per_game"
-        )
+        _recent_fantasy_points(player)
     )
 
     # --------------------------------------------------

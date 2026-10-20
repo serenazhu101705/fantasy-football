@@ -4,7 +4,7 @@ import os
 import re
 
 from contextlib import redirect_stdout
-from difflib import get_close_matches
+from difflib import get_close_matches, SequenceMatcher
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -22,6 +22,7 @@ from matchup_context import get_matchup_context
 from shadow_predictor import get_shadow_prediction
 from free_fantasy_sources import get_free_fallback_signals
 from actual_performance import get_actual_performance
+from league_settings import get_league_scoring_context, reception_points_or_default
 
 
 # ==================================================
@@ -37,10 +38,26 @@ if not ANTHROPIC_API_KEY:
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 CLAUDE_EFFORT = os.getenv("CLAUDE_EFFORT", "medium").lower()
 
-if CLAUDE_EFFORT not in {"low", "medium", "high", "xhigh", "max"}:
-    raise RuntimeError(
-        "CLAUDE_EFFORT must be one of: low, medium, high, xhigh, max"
-    )
+# Adaptive thinking uses the same output-token budget as the visible answer.
+# 1400 was too small for richer waiver comparisons, so use a larger dynamic
+# budget while keeping ordinary questions cheaper. These can be overridden in
+# .env without changing code.
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "2400"))
+CLAUDE_SIMPLE_MAX_TOKENS = int(os.getenv("CLAUDE_SIMPLE_MAX_TOKENS", "1600"))
+CLAUDE_WAIVER_MAX_TOKENS = int(os.getenv("CLAUDE_WAIVER_MAX_TOKENS", "2800"))
+CLAUDE_RETRY_MAX_TOKENS = int(os.getenv("CLAUDE_RETRY_MAX_TOKENS", "4200"))
+CLAUDE_SIMPLE_EFFORT = os.getenv("CLAUDE_SIMPLE_EFFORT", "low").lower()
+CLAUDE_DECISION_EFFORT = os.getenv("CLAUDE_DECISION_EFFORT", CLAUDE_EFFORT).lower()
+
+for _effort_name, _effort_value in {
+    "CLAUDE_EFFORT": CLAUDE_EFFORT,
+    "CLAUDE_SIMPLE_EFFORT": CLAUDE_SIMPLE_EFFORT,
+    "CLAUDE_DECISION_EFFORT": CLAUDE_DECISION_EFFORT,
+}.items():
+    if _effort_value not in {"low", "medium", "high", "xhigh", "max"}:
+        raise RuntimeError(
+            f"{_effort_name} must be one of: low, medium, high, xhigh, max"
+        )
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -52,10 +69,19 @@ client = Anthropic(api_key=ANTHROPIC_API_KEY)
 APP_CONTEXT = None
 CHAT_HISTORY = []
 EXTERNAL_PLAYER_CACHE = {}
+DECISION_CONTEXT = {
+    "players": [],
+    "horizon": None,
+    "acquisition": False,
+    "position": None,
+    "open_spot": False,
+    "requested_add_count": 1,
+}
 
 MAX_HISTORY_MESSAGES = 2
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_ROUNDS = 4
 SEASON = 2026
+APP_VERSION = "v7.5"
 
 
 # ==================================================
@@ -63,60 +89,44 @@ SEASON = 2026
 # ==================================================
 
 SYSTEM_PROMPT = """
-You are Serena's fantasy-football decision assistant.
+You are Serena's fantasy-football decision assistant. Use app evidence for every
+current player/league claim; never invent current facts.
 
-Use the fantasy tools for every current-data claim about projections, rankings,
-injuries, practices, availability, usage, waivers, lineups, matchup strength,
-market value, or the shadow ML forecast.
+Core rules:
+- OUT/IR/bye/roster status/lineup legality and supplied provider facts are binding.
+- weekly_score, ros_score, optimizer output, and deterministic winners are ADVISORY.
+  Make the final judgment from projections, rankings, actual role/volume/production,
+  health/practice, matchup, market signals, and shadow ML as relevant.
+- nflverse actual_performance is factual completed-game evidence. Explained BYE,
+  inactive/injury, reserve, suspension, or zero-stat weeks are not missing; only
+  DATA_GAP is unresolved. Averages are per confirmed game played.
+- FantasyPros is useful but optional. If it is unavailable, use ESPN + nflverse +
+  Sleeper + FantasyCalc + LeagueLogs + matchup + shadow ML and lower confidence.
+- LEAGUE CONTEXT is authoritative. Never ask the user whether the league is PPR,
+  half-PPR, standard, team count, or other settings already present there. Use the
+  ESPN-derived scoring format automatically.
+- FantasyCalc is market value, not ECR/projection. Sleeper is status/depth-chart
+  metadata, not ECR/projection. Shadow ML is advisory with zero live weight.
+- If current-status providers conflict, state the conflict; do not silently choose.
+- For waivers, NO_THRESHOLD_MOVE never means no players are available. Evaluate the
+  returned candidate_pool directly, especially with an empty roster spot.
+- When PREFETCHED APP EVIDENCE contains roster_context, you DO have current roster
+  context. Never say you cannot see the roster; use its position counts, unavailable
+  players, and focus-position players to judge roster need.
+- Follow-up context may be resolved deterministically by the app. If prefetched evidence
+  says the user is continuing a comparison between named players or changing the horizon
+  to ROS/long-term, continue that same decision without asking the user to repeat names.
+- For an open bench spot between two named waiver players, recommend the better add; do
+  not switch back to the general waiver pool unless the user asks for other candidates.
+- Treat a surname from the immediately established comparison as that same player; do not
+  re-ask which player the user means unless the app evidence itself marks the name ambiguous.
+- Do not convert an injury/workload multiplier directly into projected points.
 
-Decision philosophy:
-- Hard facts and eligibility are authoritative: OUT, IR, bye, roster status,
-  legal lineup slots, and supplied provider data must never be invented or
-  overridden.
-- weekly_score, ros_score, optimizer output, and deterministic comparisons are
-  ADVISORY summaries. They are useful evidence, not the answer. Do not blindly
-  follow their winner or score gap.
-- Make the final fantasy judgment by synthesizing the evidence that matters in
-  this specific situation: projections, ECR/rankings, role/volume, injury and
-  practice risk, matchup, market/ROS signals, and the shadow ML forecast.
-- The importance of each signal may change by situation. For example, a Friday
-  DNP can matter more than a small projection edge; a large projection gap can
-  matter more than a modest matchup difference.
-
-Provider rules:
-- FantasyPros ECR/projections are useful expert/forecast evidence when present, but they are not required for Claude to make a decision when strong factual fallback evidence exists.
-- actual_performance comes from nflverse completed-game statistics and is factual, independent of FantasyPros, and should be used heavily for role, volume, production, and trend analysis.
-- When FantasyPros is missing or rate-limited, do NOT treat the player as unevaluable. Synthesize actual_performance + ESPN + Sleeper + FantasyCalc + LeagueLogs + matchup + shadow ML as available, and lower confidence appropriately.
-- FantasyCalc is a FREE market-derived redraft value/rank based on real trades.
-  Treat it as an independent ROS/market signal. It is NOT FantasyPros ECR and
-  is NOT a weekly projection.
-- Sleeper supplies free player/status/injury/practice/depth-chart metadata. It
-  is NOT a projection or ECR provider.
-- If FantasyPros is missing or rate-limited, use the free fallback evidence
-  instead of pretending the missing FantasyPros field exists.
-- If providers conflict on a current injury/status fact, state the conflict and
-  be cautious; do not silently choose one as fact. The core can_play_this_week
-  hard-eligibility flag remains binding for lineup legality.
-- If comparison_status=FALLBACK_SUPPORTED, you may still make a recommendation
-  from the fallback evidence, but explicitly note that a primary FantasyPros
-  input is missing. If comparison_status=INCOMPLETE_DATA, be more cautious.
-- The rolling ML model is SHADOW ONLY: zero live decision weight. It may inform
-  your judgment, but it never changes weekly_score or the optimizer yet.
-- Matchup context is descriptive PPR points allowed to the position, not a
-  projection.
-- Never turn an injury/workload multiplier directly into a fantasy-points
-  projection unless a tool explicitly provides an adjusted projection.
-
-Behavior:
-- For direct two-player weekly questions, prefer compare_players_weekly.
-- For direct two-player ROS/trade questions, prefer compare_players_ros.
-- For an ML question, prefer get_shadow_prediction.
-- Never fill a missing current player-specific fact from general football
-  memory. General strategy is fine; current player claims must come from tools.
-- Do not make meta-comments about whether tools were called on earlier turns.
-- Lead with the recommendation, then the most decision-relevant evidence and
-  uncertainty. Be concise unless the user asks for detail.
+Use PREFETCHED APP EVIDENCE when present; do not call a tool again for facts already
+there unless the evidence is insufficient. Lead with the recommendation, give only
+the most decision-relevant evidence, mention material uncertainty, and stay concise.
 """
+
 
 
 # ==================================================
@@ -156,13 +166,53 @@ def _league():
     return APP_CONTEXT.get("league")
 
 
-def _league_team_count():
+def _league_settings_context():
+    context = APP_CONTEXT.get("league_settings") if APP_CONTEXT else None
+    if context:
+        return context
     league = _league()
-    teams = getattr(league, "teams", None) if league is not None else None
+    if league is not None:
+        try:
+            return get_league_scoring_context(league)
+        except Exception:
+            pass
+    return {
+        "source": "fallback",
+        "scoring_label": "UNKNOWN",
+        "reception_points": 1.0,
+        "fantasypros_scoring": "PPR",
+        "fantasypros_scoring_approximate": True,
+        "team_count": 12,
+    }
+
+
+def _league_team_count():
+    value = (_league_settings_context() or {}).get("team_count")
     try:
-        return len(teams) if teams else 12
-    except TypeError:
+        return int(value) if value else 12
+    except (TypeError, ValueError):
         return 12
+
+
+def _league_reception_points():
+    return reception_points_or_default(_league_settings_context(), default=1.0)
+
+
+def _league_fantasypros_scoring():
+    return (_league_settings_context() or {}).get("fantasypros_scoring") or "PPR"
+
+
+def _compact_league_context():
+    ctx = _league_settings_context() or {}
+    return _non_none({
+        "scoring": ctx.get("scoring_label"),
+        "reception_points": ctx.get("reception_points"),
+        "fantasypros_scoring": ctx.get("fantasypros_scoring"),
+        "fantasypros_scoring_approximate": ctx.get("fantasypros_scoring_approximate"),
+        "team_count": ctx.get("team_count"),
+        "faab": ctx.get("faab"),
+        "acquisition_budget": ctx.get("acquisition_budget"),
+    })
 
 
 def _free_fallback_context(player):
@@ -172,7 +222,7 @@ def _free_fallback_context(player):
             player,
             num_teams=_league_team_count(),
             num_qbs=1,
-            ppr=1.0,
+            ppr=_league_reception_points(),
         )
     except Exception as exc:
         return {
@@ -196,6 +246,7 @@ def _actual_performance_context(player):
             player,
             season=SEASON,
             week=_current_week(),
+            reception_points=_league_reception_points(),
         )
     except Exception as exc:
         return {
@@ -237,41 +288,108 @@ def get_all_known_players():
 
 
 def _find_loaded_player(requested_name):
+    """Resolve a player from the already-loaded roster/waiver pool.
+
+    This resolver is deliberately more typo-tolerant than the league-wide ESPN
+    resolver because the candidate universe is small and fantasy-relevant.  It
+    prefers exact full names, then exact surnames, then a conservative fuzzy
+    surname/full-name match.  This lets common inputs such as ``barnard`` resolve
+    to Germie Bernard without spending Claude calls guessing unrelated NFL names.
+    """
     players = get_all_known_players()
     requested = normalize_name(requested_name)
 
     if not requested:
         return None
 
-    for player in players:
-        if normalize_name(player.get("name")) == requested:
-            return player
+    # 1) Exact normalized full name.
+    exact = [
+        player for player in players
+        if normalize_name(player.get("name")) == requested
+    ]
+    if len(exact) == 1:
+        return exact[0]
 
+    # 2) Exact surname.  Only accept it when unique in the loaded fantasy pool.
+    requested_parts = requested.split()
+    if len(requested_parts) == 1 and len(requested) >= 4:
+        surname_matches = []
+        for player in players:
+            parts = normalize_name(player.get("name")).split()
+            if parts and parts[-1] == requested:
+                surname_matches.append(player)
+        if len(surname_matches) == 1:
+            return surname_matches[0]
+
+    # 3) Safe partial full-name matching.
     partial = []
     for player in players:
         player_name = normalize_name(player.get("name"))
         if requested in player_name or player_name in requested:
             partial.append(player)
-
     if len(partial) == 1:
         return partial[0]
 
-    lookup = {
-        normalize_name(player.get("name")): player
-        for player in players
-    }
-    fuzzy = get_close_matches(
-        requested,
-        list(lookup.keys()),
-        n=1,
-        cutoff=0.82,
-    )
-    return lookup[fuzzy[0]] if fuzzy else None
+    # 4) A one-word typo should be compared with loaded surnames, not with every
+    # NFL full name.  This is what turns "barnard" -> "Bernard" safely.
+    if len(requested_parts) == 1 and len(requested) >= 5:
+        surname_lookup = {}
+        for player in players:
+            parts = normalize_name(player.get("name")).split()
+            if not parts:
+                continue
+            surname_lookup.setdefault(parts[-1], []).append(player)
+
+        close_surnames = get_close_matches(
+            requested,
+            list(surname_lookup.keys()),
+            n=2,
+            cutoff=0.84,
+        )
+        if close_surnames:
+            best = close_surnames[0]
+            matches = surname_lookup.get(best) or []
+            # Do not guess if that surname itself maps to multiple loaded players.
+            if len(matches) == 1:
+                # If there is a nearly identical second surname, leave it ambiguous.
+                if len(close_surnames) == 1:
+                    return matches[0]
+                best_score = SequenceMatcher(None, requested, close_surnames[0]).ratio()
+                second_score = SequenceMatcher(None, requested, close_surnames[1]).ratio()
+                if best_score - second_score >= 0.08:
+                    return matches[0]
+
+    # 5) Fuzzy full-name matching is useful for small typos such as "Tree Tucker".
+    # Keep the threshold high so a vague one-word query cannot jump to a random name.
+    if len(requested_parts) >= 2:
+        lookup = {
+            normalize_name(player.get("name")): player
+            for player in players
+        }
+        fuzzy = get_close_matches(
+            requested,
+            list(lookup.keys()),
+            n=2,
+            cutoff=0.90,
+        )
+        if fuzzy:
+            if len(fuzzy) == 1:
+                return lookup[fuzzy[0]]
+            best_score = SequenceMatcher(None, requested, fuzzy[0]).ratio()
+            second_score = SequenceMatcher(None, requested, fuzzy[1]).ratio()
+            if best_score - second_score >= 0.06:
+                return lookup[fuzzy[0]]
+
+    return None
 
 
 def _resolve_espn_name(requested_name):
-    """Resolve a natural player name against ESPN's league-wide player map."""
+    """Resolve a natural player name against ESPN's league-wide player map.
 
+    League-wide fuzzy guessing is intentionally conservative.  A single vague or
+    misspelled surname such as "Barnard" must never silently become an unrelated
+    player.  Loaded roster/waiver players are handled first by _find_loaded_player().
+    """
     league = _league()
     player_map = getattr(league, "player_map", {}) or {}
 
@@ -279,23 +397,47 @@ def _resolve_espn_name(requested_name):
         return requested_name
 
     requested = normalize_name(requested_name)
+    if not requested:
+        return None
+
     normalized_lookup = {
         normalize_name(name): name
         for name in player_map.keys()
     }
 
+    # Exact full name.
     if requested in normalized_lookup:
         return normalized_lookup[requested]
 
-    fuzzy = get_close_matches(
-        requested,
-        list(normalized_lookup.keys()),
-        n=1,
-        cutoff=0.80,
-    )
+    requested_parts = requested.split()
 
-    if fuzzy:
-        return normalized_lookup[fuzzy[0]]
+    # Exact surname is okay only when globally unique.
+    if len(requested_parts) == 1 and len(requested) >= 4:
+        surname_matches = []
+        for normalized, original in normalized_lookup.items():
+            parts = normalized.split()
+            if parts and parts[-1] == requested:
+                surname_matches.append(original)
+        if len(surname_matches) == 1:
+            return surname_matches[0]
+        return None
+
+    # For a full name only, allow a very close typo with a clear margin over the
+    # runner-up.  This handles "Germie Barnard" without random global guesses.
+    if len(requested_parts) >= 2:
+        fuzzy = get_close_matches(
+            requested,
+            list(normalized_lookup.keys()),
+            n=2,
+            cutoff=0.90,
+        )
+        if fuzzy:
+            if len(fuzzy) == 1:
+                return normalized_lookup[fuzzy[0]]
+            best_score = SequenceMatcher(None, requested, fuzzy[0]).ratio()
+            second_score = SequenceMatcher(None, requested, fuzzy[1]).ratio()
+            if best_score - second_score >= 0.06:
+                return normalized_lookup[fuzzy[0]]
 
     return None
 
@@ -398,7 +540,7 @@ def _recover_external_rankings(player):
                 season=SEASON,
                 week=_current_week(),
                 position=position,
-                scoring="PPR",
+                scoring=_league_fantasypros_scoring(),
             )
             row = _find_ranking_row(result.get("players", []), player)
             if row:
@@ -419,7 +561,7 @@ def _recover_external_rankings(player):
                 season=SEASON,
                 week=_current_week(),
                 position=position,
-                scoring="PPR",
+                scoring=_league_fantasypros_scoring(),
                 ranking_type="ROS",
             )
             row = _find_ranking_row(result.get("players", []), player)
@@ -492,6 +634,8 @@ def lookup_external_player(requested_name):
             week=_current_week(),
             include_player_specific=True,
             include_injuries=True,
+            scoring=_league_fantasypros_scoring(),
+            reception_points=_league_reception_points(),
         )
     except TypeError:
         # Backward compatibility with an older enrich_players signature.
@@ -527,6 +671,16 @@ def find_player(requested_name, allow_external=True):
 # ==================================================
 
 def _shadow_context(player):
+    if abs(_league_reception_points() - 1.0) > 1e-9:
+        return {
+            "available": False,
+            "reason": (
+                "Current shadow model is trained on full-PPR targets; disabled for "
+                f"{(_league_settings_context() or {}).get('scoring_label')} so it is not "
+                "compared against differently scored league projections."
+            ),
+        }
+
     result = get_shadow_prediction(
         player,
         season=SEASON,
@@ -541,7 +695,7 @@ def _shadow_context(player):
 
     prediction = result.get("prediction_ppr")
     espn = player.get("espn_projected_points")
-    fantasypros = player.get("fp_ppr")
+    fantasypros = player.get("fp_points") if player.get("fp_points") is not None else player.get("fp_ppr")
 
     source_values = []
     for value in (espn, fantasypros):
@@ -642,7 +796,7 @@ def compact_player(
         "opponent": player.get("opponent"),
         "projection_source": player.get("projection_source"),
         "espn_projection": player.get("espn_projected_points"),
-        "fantasypros_projection": player.get("fp_ppr"),
+        "fantasypros_projection": player.get("fp_points") if player.get("fp_points") is not None else player.get("fp_ppr"),
         "weekly_ecr": (
             player.get("ecr")
             if player.get("ecr") is not None
@@ -658,7 +812,7 @@ def compact_player(
         "ros_score_advisory": player.get("ros_score"),
         "leaguelogs_ros_rank": leaguelogs.get("ros_pos_rank"),
         "leaguelogs_market_value": leaguelogs.get("market_value"),
-        "recent_ppr": usage.get("ppr_points_per_game"),
+        "recent_fantasy_points": usage.get("fantasy_points_per_game") if usage.get("fantasy_points_per_game") is not None else usage.get("ppr_points_per_game"),
         "carries_per_game": usage.get("carries_per_game"),
         "targets_per_game": usage.get("targets_per_game"),
         "snap_share": usage.get("snap_share"),
@@ -698,52 +852,104 @@ def compact_player(
     return result
 
 
-def _comparison_player(player, include_shadow=False):
+def _compact_actual_for_decision(player):
+    """Actual stats without full week-by-week logs for routine decisions."""
+    actual = _actual_performance_context(player)
+    if not actual.get("available"):
+        return actual
+
+    coverage = actual.get("week_coverage") or {}
+    return _non_none({
+        "available": True,
+        "source": "nflverse",
+        "through_week": actual.get("through_week"),
+        "games_played": actual.get("games_played"),
+        "season": actual.get("season"),
+        "last_3": actual.get("last_3_played_games"),
+        "last_3_vs_season": actual.get("last_3_vs_season"),
+        "coverage_complete": coverage.get("coverage_complete"),
+        "unresolved_weeks": coverage.get("unresolved_weeks") or None,
+    })
+
+
+def _compact_free_for_decision(player):
+    """Keep only decision-relevant free fallback fields."""
+    fallback = _free_fallback_context(player)
+    fantasycalc = fallback.get("fantasycalc") or {}
+    sleeper = fallback.get("sleeper") or {}
+
+    fc = _non_none({
+        "available": fantasycalc.get("available"),
+        "redraft_value": fantasycalc.get("redraft_value"),
+        "overall_rank": fantasycalc.get("overall_rank"),
+        "position_rank": fantasycalc.get("position_rank"),
+        "trend_30_day": fantasycalc.get("trend_30_day"),
+    })
+    sl = _non_none({
+        "available": sleeper.get("available"),
+        "status": sleeper.get("status"),
+        "injury_status": sleeper.get("injury_status"),
+        "injury_body_part": sleeper.get("injury_body_part"),
+        "practice_participation": sleeper.get("practice_participation"),
+        "depth_chart_order": sleeper.get("depth_chart_order"),
+        "depth_chart_position": sleeper.get("depth_chart_position"),
+    })
+    return {"fantasycalc": fc, "sleeper": sl}
+
+
+def _compact_matchup_for_decision(player):
+    matchup = get_matchup_context(
+        player,
+        season=SEASON,
+        week=_current_week(),
+    )
+    if not matchup.get("available"):
+        return _non_none({
+            "available": False,
+            "opponent": matchup.get("opponent"),
+            "reason": matchup.get("reason"),
+        })
+    return _non_none({
+        "available": True,
+        "opponent": matchup.get("opponent"),
+        "label": matchup.get("label"),
+        "relative_to_league_pct": matchup.get("relative_to_league_pct"),
+        "easiest_matchup_rank": matchup.get("easiest_matchup_rank"),
+        "defenses_ranked": matchup.get("defenses_ranked"),
+        "sample_games": matchup.get("sample_games"),
+    })
+
+
+def _comparison_player(player, include_shadow=False, include_matchup=True):
+    # Start from cheap/core fields. Rich evidence is added back in compact form.
     compact = compact_player(
         player,
-        include_shadow=include_shadow,
-        include_matchup=True,
-        include_free=True,
+        include_shadow=False,
+        include_matchup=False,
+        include_free=False,
+        include_actual=False,
     )
 
     wanted = {
-        "name",
-        "position",
-        "team",
-        "opponent",
-        "espn_projection",
-        "fantasypros_projection",
-        "weekly_ecr",
-        "weekly_score_advisory",
-        "fantasypros_ros_rank",
-        "ros_score_advisory",
-        "leaguelogs_ros_rank",
-        "leaguelogs_market_value",
-        "recent_ppr",
-        "carries_per_game",
-        "targets_per_game",
-        "injury_status",
-        "can_play_this_week",
-        "weekly_multiplier",
-        "risk_level",
-        "play_probability",
-        "practice_summary",
-        "weekly_data_complete",
-        "weekly_missing_data",
-        "ros_data_complete",
-        "ros_missing_data",
-        "actual_performance",
-        "matchup",
-        "ml_shadow",
-        "free_fallback",
+        "name", "position", "team", "opponent",
+        "espn_projection", "fantasypros_projection", "weekly_ecr",
+        "weekly_score_advisory", "fantasypros_ros_rank", "ros_score_advisory",
+        "leaguelogs_ros_rank", "leaguelogs_market_value",
+        "recent_fantasy_points", "carries_per_game", "targets_per_game",
+        "injury_status", "can_play_this_week", "weekly_multiplier",
+        "risk_level", "play_probability", "practice_summary",
+        "weekly_data_complete", "weekly_missing_data",
+        "ros_data_complete", "ros_missing_data",
     }
+    result = {key: value for key, value in compact.items() if key in wanted}
 
-    return {
-        key: value
-        for key, value in compact.items()
-        if key in wanted
-    }
-
+    result["actual_performance"] = _compact_actual_for_decision(player)
+    result["free_fallback"] = _compact_free_for_decision(player)
+    if include_matchup:
+        result["matchup"] = _compact_matchup_for_decision(player)
+    if include_shadow:
+        result["ml_shadow"] = _shadow_context(player)
+    return result
 
 def _fallback_available(player_context, source):
     return bool(
@@ -837,6 +1043,7 @@ def tool_get_roster():
     return {
         "league": league.settings.name if league is not None else None,
         "week": _current_week(),
+        "league_settings": _compact_league_context(),
         # Keep roster-wide responses smaller. Claude can call player_details for
         # shadow predictions on individual players if needed.
         "players": [
@@ -926,8 +1133,8 @@ def tool_compare_players_ros(player_a, player_b):
             "missing_players": missing,
         }
 
-    first_context = _comparison_player(first, include_shadow=False)
-    second_context = _comparison_player(second, include_shadow=False)
+    first_context = _comparison_player(first, include_shadow=False, include_matchup=False)
+    second_context = _comparison_player(second, include_shadow=False, include_matchup=False)
     status = _comparison_status(first_context, second_context, mode="ros")
 
     advisory = None
@@ -970,9 +1177,141 @@ def tool_get_optimal_lineup():
     }
 
 
-def tool_get_waiver_recommendations():
+def _normalize_waiver_position(position):
+    if position is None:
+        return None
+
+    value = str(position).strip().upper()
+    aliases = {
+        "": None,
+        "ALL": None,
+        "ANY": None,
+        "FLEX": None,
+        "DST": "D/ST",
+        "DEF": "D/ST",
+        "DEFENSE": "D/ST",
+    }
+    return aliases.get(value, value)
+
+
+def _waiver_candidate_sort_key(player):
+    def number(key):
+        try:
+            value = player.get(key)
+            return float(value) if value is not None else -1.0
+        except (TypeError, ValueError):
+            return -1.0
+
+    # The prescreen score is specifically designed to rank the already-loaded
+    # waiver shortlist. The remaining fields are deterministic tie-breakers.
+    return (
+        number("waiver_prescreen_score"),
+        number("weekly_score"),
+        number("ros_score"),
+        number("fp_points") if player.get("fp_points") is not None else number("fp_ppr"),
+    )
+
+
+def _compact_waiver_actual(player):
+    return _compact_actual_for_decision(player)
+
+
+def _compact_waiver_candidate(player, include_detail=True):
+    core = compact_player(
+        player,
+        include_shadow=False,
+        include_matchup=False,
+        include_free=False,
+        include_actual=False,
+    )
+    wanted = {
+        "name", "position", "team", "opponent",
+        "espn_projection", "fantasypros_projection", "weekly_ecr",
+        "weekly_score_advisory", "fantasypros_ros_rank", "ros_score_advisory",
+        "leaguelogs_ros_rank", "leaguelogs_market_value",
+        "recent_fantasy_points", "carries_per_game", "targets_per_game",
+        "injury_status", "can_play_this_week", "risk_level",
+        "play_probability", "practice_summary", "on_bye_week",
+        "weekly_data_complete", "ros_data_complete",
+    }
+    payload = {k: v for k, v in core.items() if k in wanted}
+    payload["waiver_prescreen_score"] = player.get("waiver_prescreen_score")
+
+    if include_detail:
+        payload["actual_performance"] = _compact_waiver_actual(player)
+        payload["matchup"] = _compact_matchup_for_decision(player)
+        payload["free_fallback"] = _compact_free_for_decision(player)
+
+    return payload
+
+def tool_get_waiver_recommendations(position=None, limit=5):
+    """Return actionable transactions AND the actual loaded waiver candidates.
+
+    The old version returned only candidates[:8] when no transaction cleared the
+    add/drop threshold. Because waiver_candidates is grouped QB -> RB -> WR -> TE,
+    that hid every WR and TE from Claude. This function always exposes a
+    position-filterable candidate pool, independent of the transaction threshold.
+    """
+
     transactions = APP_CONTEXT.get("waiver_transactions") or []
     candidates = APP_CONTEXT.get("waiver_candidates") or []
+
+    requested_position = _normalize_waiver_position(position)
+    allowed_positions = {"QB", "RB", "WR", "TE", "K", "D/ST"}
+    if requested_position is not None and requested_position not in allowed_positions:
+        return {
+            "success": False,
+            "error": f"Unsupported position: {position}",
+            "supported_positions": sorted(allowed_positions),
+        }
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 5
+    limit = max(1, min(limit, 12))
+
+    # Count what is actually loaded before filtering. This prevents Claude from
+    # interpreting a truncated/general list as evidence that a position is empty.
+    position_counts = {}
+    for player in candidates:
+        pos = player.get("position") or "UNKNOWN"
+        position_counts[pos] = position_counts.get(pos, 0) + 1
+
+    filtered_candidates = [
+        player
+        for player in candidates
+        if requested_position is None
+        or player.get("position") == requested_position
+    ]
+    filtered_candidates = sorted(
+        filtered_candidates,
+        key=_waiver_candidate_sort_key,
+        reverse=True,
+    )
+
+    # For a requested position, give Claude rich evidence for the actual top
+    # candidates. For a general waiver query, return a BALANCED pool instead of
+    # taking a global slice that could again hide whole positions.
+    include_detail = requested_position is not None
+
+    if requested_position is not None:
+        selected_candidates = filtered_candidates[:limit]
+    else:
+        per_position_limit = min(limit, 3)
+        selected_candidates = []
+        for pos in ("QB", "RB", "WR", "TE"):
+            position_group = sorted(
+                [p for p in candidates if p.get("position") == pos],
+                key=_waiver_candidate_sort_key,
+                reverse=True,
+            )
+            selected_candidates.extend(position_group[:per_position_limit])
+
+    candidate_pool = [
+        _compact_waiver_candidate(player, include_detail=include_detail)
+        for player in selected_candidates
+    ]
 
     actionable = {"STRONG_ADD", "ADD", "STASH", "STREAMER"}
     moves = []
@@ -984,8 +1323,10 @@ def tool_get_waiver_recommendations():
             continue
 
         add_player = transaction.get("add") or {}
-        drop_player = transaction.get("drop") or {}
+        if requested_position is not None and add_player.get("position") != requested_position:
+            continue
 
+        drop_player = transaction.get("drop") or {}
         key = add_player.get("espn_id") or normalize_name(add_player.get("name"))
         if key in seen:
             continue
@@ -993,8 +1334,23 @@ def tool_get_waiver_recommendations():
 
         moves.append(_non_none({
             "category": category,
-            "add": compact_player(add_player, include_shadow=False, include_matchup=False, include_free=False, include_actual=False),
-            "drop": compact_player(drop_player, include_shadow=False, include_matchup=False, include_free=False, include_actual=False) if drop_player else None,
+            "add": compact_player(
+                add_player,
+                include_shadow=False,
+                include_matchup=False,
+                include_free=False,
+                include_actual=False,
+            ),
+            "drop": (
+                compact_player(
+                    drop_player,
+                    include_shadow=False,
+                    include_matchup=False,
+                    include_free=False,
+                    include_actual=False,
+                )
+                if drop_player else None
+            ),
             "weekly_lineup_delta": transaction.get("weekly_lineup_delta"),
             "projected_points_delta": transaction.get("projected_points_delta"),
             "ros_delta": transaction.get("ros_delta"),
@@ -1004,22 +1360,35 @@ def tool_get_waiver_recommendations():
             "reason": transaction.get("recommendation_reason"),
         }))
 
-        if len(moves) >= 5:
+        if len(moves) >= limit:
             break
 
-    if not moves:
-        return {
-            "recommendation": "NO_MOVE",
-            "moves": [],
-            "top_loaded_candidates": [
-                compact_player(p, include_shadow=False, include_matchup=False, include_free=False, include_actual=False)
-                for p in candidates[:8]
-            ],
-        }
-
     return {
-        "recommendation": "ACTIONABLE_MOVES",
+        "success": True,
+        "requested_position": requested_position or "ALL",
+        "candidate_source": (
+            "Current ESPN free-agent pool shortlisted by the app; candidates are "
+            "loaded independently of whether an add/drop transaction clears the "
+            "deterministic threshold."
+        ),
+        "loaded_position_counts": position_counts,
+        "matching_candidates_loaded": len(filtered_candidates),
+        "candidate_pool_returned": len(candidate_pool),
+        "candidate_pool_scope": (
+            "Top requested-position candidates"
+            if requested_position is not None
+            else "Balanced top candidates across QB/RB/WR/TE"
+        ),
+        "candidate_pool": candidate_pool,
+        "transaction_model_result": (
+            "ACTIONABLE_MOVES" if moves else "NO_THRESHOLD_MOVE"
+        ),
         "moves": moves,
+        "interpretation": (
+            "NO_THRESHOLD_MOVE does NOT mean there are no available players. "
+            "When the user has an empty bench spot, evaluate candidate_pool directly "
+            "because no drop is required."
+        ),
     }
 
 
@@ -1036,7 +1405,7 @@ def tool_get_shadow_prediction(player_name):
         "found": True,
         "player": player.get("name"),
         "espn_projection": player.get("espn_projected_points"),
-        "fantasypros_projection": player.get("fp_ppr"),
+        "fantasypros_projection": player.get("fp_points") if player.get("fp_points") is not None else player.get("fp_ppr"),
         "weekly_ecr": player.get("ecr"),
         "availability": player.get("availability"),
         "matchup": get_matchup_context(
@@ -1054,6 +1423,7 @@ def tool_get_system_status():
     return {
         "league": league.settings.name if league is not None else None,
         "week": _current_week(),
+        "league_settings": _compact_league_context(),
         "loaded_players": len(get_all_known_players()),
         "external_player_cache": len(EXTERNAL_PLAYER_CACHE),
         "decision_architecture": {
@@ -1152,10 +1522,27 @@ TOOLS = [
     },
     {
         "name": "get_waiver_recommendations",
-        "description": "Get current waiver and add/drop recommendations.",
+        "description": (
+            "Inspect the current ESPN waiver/free-agent shortlist. Can filter by "
+            "position (for example WR) and returns the actual candidate pool even "
+            "when no deterministic add/drop transaction clears the threshold. Use "
+            "the position filter whenever the user asks for a specific position."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "position": {
+                    "type": "string",
+                    "enum": ["QB", "RB", "WR", "TE", "K", "D/ST", "ALL"],
+                    "description": "Optional position filter. Use ALL if no position is requested.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 12,
+                    "description": "Maximum candidates/moves to return; default 5.",
+                },
+            },
             "additionalProperties": False,
         },
     },
@@ -1209,18 +1596,21 @@ def select_tools_for_message(user_message):
     if any(term in text for term in ("rest of season", "ros", "trade", "keeper", "long term", "longterm")):
         return pick("compare_players_ros", "get_player_details")
 
+    # Waiver intent must be checked BEFORE start/sit intent. A request such as
+    # "I have an empty bench spot; who should I pick up from waivers?" contains
+    # the word "bench" but is fundamentally a waiver query.
+    if _looks_like_waiver_acquisition(user_message):
+        return pick(
+            "get_waiver_recommendations",
+            "get_roster",
+            "get_player_details",
+        )
+
     if any(term in text for term in ("start", "sit", "flex", "bench", "this week")):
         return pick(
             "compare_players_weekly",
             "get_player_details",
             "get_optimal_lineup",
-        )
-
-    if any(term in text for term in ("waiver", "pickup", "pick up", "add", "drop", "free agent", "streamer")):
-        return pick(
-            "get_waiver_recommendations",
-            "get_roster",
-            "get_player_details",
         )
 
     if any(term in text for term in ("lineup", "starting lineup", "team")):
@@ -1235,6 +1625,765 @@ def select_tools_for_message(user_message):
 
     return TOOLS
 
+
+
+# ==================================================
+# Cheap intent prefetch
+# ==================================================
+
+def _looks_like_waiver_acquisition(user_message):
+    """Recognize waiver/add intent even when the user does not say "waiver".
+
+    Examples we want to catch cheaply:
+      - "I want to take 2 WRs"
+      - "best move for my empty roster spot"
+      - "who should I grab at receiver"
+    """
+    text = normalize_name(user_message)
+
+    direct_terms = (
+        "waiver", "pickup", "pick up", "free agent", "streamer",
+        "add ", "drop ", "claim ", "grab ",
+    )
+    if any(term in text for term in direct_terms):
+        return True
+
+    position_terms = (
+        " qb", " qbs", "quarterback",
+        " rb", " rbs", "running back",
+        " wr", " wrs", "wide receiver", "receiver",
+        " te", " tes", "tight end",
+        " kicker", " defense", " dst", " d st",
+    )
+    acquisition_terms = (
+        "take ", "want ", "need ", "get ", "target ",
+        "best move", "roster spot", "empty spot", "open spot",
+        "empty bench", "open bench",
+    )
+
+    return (
+        any(term in f" {text}" for term in position_terms)
+        and any(term in text for term in acquisition_terms)
+    )
+
+
+def _intent_for_message(user_message):
+    text = normalize_name(user_message)
+    if _looks_like_waiver_acquisition(user_message):
+        return "waiver"
+    if any(term in text for term in ("rest of season", "ros", "trade", "keeper", "long term", "longterm")):
+        return "ros"
+    if any(term in text for term in ("ml", "model", "predict", "prediction", "shadow")):
+        return "ml"
+    if any(term in text for term in ("actual stats", "actual data", "stats", "statistics", "usage", "targets", "carries", "production")):
+        return "stats"
+    if any(term in text for term in ("start", "sit", "flex", "bench", "this week")):
+        return "weekly"
+    if any(term in text for term in ("lineup", "starting lineup")):
+        return "lineup"
+    return None
+
+
+def _extract_requested_position(user_message):
+    text = f" {normalize_name(user_message)} "
+    checks = (
+        ("D/ST", (" d st ", " dst ", " defense ", " defenses ", " defence ")),
+        ("QB", (" qb ", " qbs ", " quarterback ", " quarterbacks ")),
+        ("RB", (" rb ", " rbs ", " running back ", " running backs ")),
+        ("WR", (" wr ", " wrs ", " wide receiver ", " wide receivers ", " receiver ", " receivers ")),
+        ("TE", (" te ", " tes ", " tight end ", " tight ends ")),
+        ("K", (" kicker ", " kickers ", " k ")),
+    )
+    for position, terms in checks:
+        if any(term in text for term in terms):
+            return position
+    return None
+
+
+def _extract_requested_add_count(user_message):
+    """Best-effort count for requests like "take 2 WRs". Defaults to one."""
+    text = normalize_name(user_message)
+    word_numbers = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    }
+
+    patterns = (
+        r"\b([1-5])\s+(?:qbs?|rbs?|wrs?|tes?|wide receivers?|running backs?|quarterbacks?|tight ends?)\b",
+        r"\b(one|two|three|four|five)\s+(?:qbs?|rbs?|wrs?|tes?|wide receivers?|running backs?|quarterbacks?|tight ends?)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        raw = match.group(1)
+        if raw.isdigit():
+            return int(raw)
+        return word_numbers.get(raw, 1)
+
+    return 1
+
+
+def _all_resolvable_names():
+    names = []
+    seen = set()
+
+    for player in get_all_known_players():
+        name = player.get("name")
+        key = normalize_name(name)
+        if key and key not in seen:
+            seen.add(key)
+            names.append(name)
+
+    league = _league()
+    player_map = getattr(league, "player_map", {}) or {}
+    for name in player_map.keys():
+        key = normalize_name(name)
+        if key and key not in seen:
+            seen.add(key)
+            names.append(name)
+
+    return names
+
+
+def _extract_player_names(user_message, max_players=2):
+    """Resolve player mentions cheaply without spending a Claude tool-selection call.
+
+    Resolution order matters for both continuity and cost:
+      1. players already in the current decision context,
+      2. loaded roster/waiver players,
+      3. the wider ESPN name map.
+
+    A surname that was already established in the conversation (for example
+    "Washington" after "Malik Washington") is therefore resolved to that same
+    player rather than treated as globally ambiguous.
+    """
+    text = normalize_name(user_message)
+    padded = f" {text} "
+    found = []
+    used = set()
+
+    def add_name(name):
+        key = normalize_name(name)
+        if key and key not in used:
+            used.add(key)
+            found.append(name)
+        return len(found) >= max_players
+
+    # 1) Conversation-local aliases.  Once Malik Washington has been established,
+    # a later "Worthy or Washington" should not forget which Washington was meant.
+    context_names = list(DECISION_CONTEXT.get("players") or [])
+    context_hits = []
+    for name in context_names:
+        norm = normalize_name(name)
+        parts = norm.split()
+        if not parts:
+            continue
+        candidates = [norm]
+        if len(parts[-1]) >= 4:
+            candidates.append(parts[-1])
+        best_pos = None
+        for candidate in candidates:
+            pos = padded.find(f" {candidate} ")
+            if pos >= 0 and (best_pos is None or pos < best_pos):
+                best_pos = pos
+        if best_pos is not None:
+            context_hits.append((best_pos, name))
+
+    for _, name in sorted(context_hits):
+        if add_name(name):
+            return found
+
+    loaded_names = []
+    loaded_seen = set()
+    for player in get_all_known_players():
+        name = player.get("name")
+        key = normalize_name(name)
+        if key and key not in loaded_seen:
+            loaded_seen.add(key)
+            loaded_names.append(name)
+
+    all_names = _all_resolvable_names()
+
+    def add_full_name_hits(names):
+        hits = []
+        for name in names:
+            norm = normalize_name(name)
+            if len(norm) < 4:
+                continue
+            pos = padded.find(f" {norm} ")
+            if pos >= 0:
+                hits.append((pos, -len(norm), name))
+        for _, _, name in sorted(hits):
+            if add_name(name):
+                return True
+        return False
+
+    if add_full_name_hits(loaded_names):
+        return found
+    if add_full_name_hits(all_names):
+        return found
+
+    def add_unique_surname_hits(names):
+        surname_map = {}
+        for name in names:
+            norm = normalize_name(name)
+            parts = norm.split()
+            if not parts:
+                continue
+            surname = parts[-1]
+            if len(surname) < 4:
+                continue
+            surname_map.setdefault(surname, []).append(name)
+
+        hits = []
+        for surname, matches in surname_map.items():
+            unique = []
+            seen_names = set()
+            for name in matches:
+                key = normalize_name(name)
+                if key not in seen_names:
+                    seen_names.add(key)
+                    unique.append(name)
+            if len(unique) != 1:
+                continue
+            pos = padded.find(f" {surname} ")
+            if pos >= 0:
+                hits.append((pos, unique[0]))
+
+        for _, name in sorted(hits):
+            if add_name(name):
+                return True
+        return False
+
+    if add_unique_surname_hits(loaded_names):
+        return found
+    if add_unique_surname_hits(all_names):
+        return found
+
+    # 4) Conservative typo recovery for individual words against LOADED surnames.
+    # This catches "barnard" -> Bernard cheaply.  We do not do this against the
+    # entire NFL map because that caused unrelated guesses in v7.4.
+    loaded_surname_lookup = {}
+    for name in loaded_names:
+        parts = normalize_name(name).split()
+        if parts:
+            loaded_surname_lookup.setdefault(parts[-1], []).append(name)
+
+    stop_words = {
+        "or", "vs", "versus", "for", "long", "term", "rest", "season",
+        "stash", "wr", "rb", "qb", "te", "the", "of", "a", "an", "i",
+        "mean", "meant", "thinking", "week", "this", "who", "better",
+    }
+    typo_hits = []
+    for token_match in re.finditer(r"\b[a-z][a-z0-9']{4,}\b", text):
+        token = token_match.group(0)
+        if token in stop_words or token in loaded_surname_lookup:
+            continue
+        close = get_close_matches(
+            token,
+            list(loaded_surname_lookup.keys()),
+            n=2,
+            cutoff=0.84,
+        )
+        if not close:
+            continue
+        best = close[0]
+        mapped = loaded_surname_lookup.get(best) or []
+        if len(mapped) != 1:
+            continue
+        if len(close) > 1:
+            best_score = SequenceMatcher(None, token, close[0]).ratio()
+            second_score = SequenceMatcher(None, token, close[1]).ratio()
+            if best_score - second_score < 0.08:
+                continue
+        typo_hits.append((token_match.start(), mapped[0]))
+
+    for _, name in sorted(typo_hits):
+        if add_name(name):
+            break
+
+    return found
+
+
+def _reset_decision_context():
+    DECISION_CONTEXT.clear()
+    DECISION_CONTEXT.update({
+        "players": [],
+        "horizon": None,
+        "acquisition": False,
+        "position": None,
+        "open_spot": False,
+        "requested_add_count": 1,
+    })
+
+
+def _explicit_horizon(user_message):
+    """Return an explicitly requested decision horizon, if any."""
+    text = normalize_name(user_message)
+    tokens = set(text.split())
+
+    # Be tolerant of common typing errors such as "rest tof the season" or
+    # "reset of the season".  If the user mentions season together with rest/reset,
+    # the intended horizon is clearly ROS.
+    if (
+        any(term in text for term in (
+            "rest of season", "ros", "long term", "longterm", "keeper",
+            "stash", "hold long", "for the season",
+        ))
+        or ("season" in tokens and ("rest" in tokens or "reset" in tokens))
+    ):
+        return "ros"
+    if any(term in text for term in (
+        "this week", "start", "sit", "lineup", "today", "tonight",
+    )):
+        return "weekly"
+    return None
+
+
+def _mentions_open_spot(user_message):
+    text = normalize_name(user_message)
+    return any(
+        phrase in text
+        for phrase in (
+            "empty bench", "empty spot", "open bench", "open spot",
+            "empty roster spot", "open roster spot", "free bench spot",
+        )
+    )
+
+
+def _merge_corrected_player(previous_players, new_player):
+    """Replace the likely mistaken player while preserving the other comparison side."""
+    previous_players = list(previous_players or [])[:4]
+    if not previous_players:
+        return [new_player]
+
+    new_norm = normalize_name(new_player)
+    new_surname = new_norm.split()[-1] if new_norm.split() else new_norm
+
+    # If this player was already in context, keep the existing comparison intact.
+    for existing in previous_players:
+        if normalize_name(existing) == new_norm:
+            return previous_players
+
+    similarities = []
+    for index, existing in enumerate(previous_players):
+        existing_norm = normalize_name(existing)
+        parts = existing_norm.split()
+        existing_surname = parts[-1] if parts else existing_norm
+        score = max(
+            SequenceMatcher(None, new_norm, existing_norm).ratio(),
+            SequenceMatcher(None, new_surname, existing_surname).ratio(),
+        )
+        similarities.append((score, index))
+
+    # A correction usually resembles the mistaken name (Barner/Barnard/Bernard).
+    best_score, replace_index = max(similarities)
+    if best_score < 0.55:
+        # If no previous player resembles the correction, replace the most recently
+        # mentioned side rather than throwing away the entire comparison.
+        replace_index = len(previous_players) - 1
+
+    merged = list(previous_players)
+    merged[replace_index] = new_player
+
+    deduped = []
+    seen = set()
+    for name in merged:
+        key = normalize_name(name)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(name)
+    return deduped
+
+
+def _is_correction_turn(user_message):
+    text = normalize_name(user_message)
+    return any(
+        phrase in text
+        for phrase in (
+            "i mean", "i meant", "meant ", "sorry", "actually", "correction",
+        )
+    )
+
+
+def _derive_turn_context(user_message):
+    """Resolve cheap conversational state before Claude sees the turn."""
+    context = dict(DECISION_CONTEXT)
+    previous_players = list(DECISION_CONTEXT.get("players") or [])
+    context["players"] = list(previous_players)
+
+    names = _extract_player_names(user_message, max_players=4)
+    if len(names) >= 2:
+        context["players"] = names
+    elif len(names) == 1:
+        # A correction such as "I meant Germie Bernard" should repair the mistaken
+        # side of the previous A-vs-B comparison, not erase the other player.
+        if _is_correction_turn(user_message) and len(previous_players) >= 2:
+            context["players"] = _merge_corrected_player(previous_players, names[0])
+        else:
+            # If the single name is merely shorthand for one side of an established
+            # comparison, keep the pair; otherwise start a new single-player context.
+            prior_keys = {normalize_name(x) for x in previous_players}
+            if normalize_name(names[0]) in prior_keys and len(previous_players) >= 2:
+                context["players"] = previous_players
+            else:
+                context["players"] = names
+
+    horizon = _explicit_horizon(user_message)
+    if horizon is not None:
+        context["horizon"] = horizon
+
+    position = _extract_requested_position(user_message)
+    if position is not None:
+        context["position"] = position
+
+    requested_count = _extract_requested_add_count(user_message)
+    if requested_count > 1:
+        context["requested_add_count"] = requested_count
+
+    if _looks_like_waiver_acquisition(user_message):
+        context["acquisition"] = True
+
+    if _mentions_open_spot(user_message):
+        context["open_spot"] = True
+        context["acquisition"] = True
+
+    explicit_intent = _intent_for_message(user_message)
+    players = context.get("players") or []
+
+    # If a terse A-or-B prompt names two players that are both already loaded as
+    # unrostered/free agents, infer an acquisition comparison without a Claude round.
+    if len(players) >= 2 and not context.get("acquisition"):
+        loaded = [_find_loaded_player(name) for name in players[:2]]
+        if all(
+            player is not None and player.get("rostered") is False
+            for player in loaded
+        ):
+            context["acquisition"] = True
+
+    if len(players) >= 2 and context.get("acquisition"):
+        if context.get("horizon") == "ros" or explicit_intent == "ros":
+            effective_intent = "ros_acquisition_compare"
+        elif context.get("horizon") == "weekly" or explicit_intent == "weekly":
+            effective_intent = "weekly_acquisition_compare"
+        else:
+            effective_intent = "acquisition_compare"
+    elif explicit_intent == "ros" and len(players) >= 2:
+        effective_intent = "ros"
+    elif explicit_intent == "weekly" and len(players) >= 2:
+        effective_intent = "weekly"
+    else:
+        effective_intent = explicit_intent
+
+    context["effective_intent"] = effective_intent
+    context["current_names"] = names
+    return context
+
+
+def _persist_turn_context(turn_context):
+    """Persist only tiny structured context; never store bulky provider payloads."""
+    for key in (
+        "players", "horizon", "acquisition", "position",
+        "open_spot", "requested_add_count",
+    ):
+        if key in turn_context:
+            value = turn_context[key]
+            if key == "players":
+                value = list(value or [])[:4]
+            DECISION_CONTEXT[key] = value
+
+
+def _update_turn_context_from_tool(turn_context, tool_name, tool_input, result):
+    """Learn tiny conversational state from tools Claude actually used.
+
+    This is essential when Claude resolves a surname that the cheap local parser did
+    not. Without it, the answer can mention Tucker/Worthy correctly but the next turn
+    forgets them because DECISION_CONTEXT never learned the tool-resolved names.
+    """
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    result = result if isinstance(result, dict) else {}
+
+    if tool_name in {"compare_players_weekly", "compare_players_ros"}:
+        names = []
+        for key in ("player_a", "player_b"):
+            value = result.get(key)
+            if isinstance(value, dict):
+                name = value.get("name")
+                if name:
+                    names.append(name)
+        if len(names) < 2:
+            names = [
+                tool_input.get("player_a"),
+                tool_input.get("player_b"),
+            ]
+            names = [name for name in names if name]
+
+        if len(names) >= 2:
+            turn_context["players"] = names[:2]
+
+        turn_context["horizon"] = (
+            "ros" if tool_name == "compare_players_ros" else "weekly"
+        )
+
+        # If both resolved players are currently unrostered, remember that this
+        # is an acquisition choice so later "long term" / "empty spot" turns
+        # remain about these same waiver candidates.
+        resolved = [find_player(name, allow_external=False) for name in names[:2]]
+        if len(resolved) == 2 and all(
+            player is not None and player.get("rostered") is False
+            for player in resolved
+        ):
+            turn_context["acquisition"] = True
+
+    elif tool_name == "get_player_details":
+        player_payload = result.get("player") or {}
+        name = player_payload.get("name") or tool_input.get("player_name")
+        if name:
+            players = list(turn_context.get("players") or [])
+            if normalize_name(name) not in {normalize_name(x) for x in players}:
+                players.append(name)
+            turn_context["players"] = players[-4:]
+
+    elif tool_name == "get_waiver_recommendations":
+        turn_context["acquisition"] = True
+        position = tool_input.get("position")
+        if position and position != "ALL":
+            turn_context["position"] = position
+
+
+def _prefetch_acquisition_compare(turn_context):
+    """Compact evidence for choosing between named waiver/bench targets."""
+    names = list(turn_context.get("players") or [])[:2]
+    if len(names) < 2:
+        return None
+
+    first = find_player(names[0])
+    second = find_player(names[1])
+    if first is None or second is None:
+        return None
+
+    horizon = turn_context.get("horizon") or "overall_hold"
+    include_matchup = horizon != "ros"
+    first_context = _comparison_player(
+        first,
+        include_shadow=False,
+        include_matchup=include_matchup,
+    )
+    second_context = _comparison_player(
+        second,
+        include_shadow=False,
+        include_matchup=include_matchup,
+    )
+
+    mode = "ros" if horizon == "ros" else "weekly"
+    status = _comparison_status(first_context, second_context, mode=mode)
+
+    return {
+        "intent": "waiver_player_compare",
+        "week": _current_week(),
+        "horizon": horizon,
+        "open_spot": bool(turn_context.get("open_spot")),
+        "players": names,
+        "comparison_status": status,
+        "player_a": first_context,
+        "player_b": second_context,
+        "instruction": (
+            "Choose between these named players for the user's roster spot. "
+            + (
+                "Prioritize rest-of-season role, actual usage/production, health, and "
+                "market/ROS evidence; current-week matchup is intentionally omitted."
+                if horizon == "ros"
+                else "Balance sustainable role/market value with current production and weekly outlook."
+            )
+            + " Do not replace them with a different waiver candidate unless asked."
+        ),
+    }
+
+
+def _compact_roster_need(position=None):
+    """Compact roster context for waiver decisions without sending the whole roster blob."""
+    roster = APP_CONTEXT.get("roster") or []
+
+    counts = {}
+    unavailable = []
+    for p in roster:
+        pos = p.get("position") or "UNKNOWN"
+        counts[pos] = counts.get(pos, 0) + 1
+        availability = p.get("availability") or {}
+        if not availability.get("can_play_this_week", True):
+            unavailable.append(_non_none({
+                "name": p.get("name"),
+                "position": pos,
+                "reason": availability.get("reason") or p.get("injury_status"),
+            }))
+
+    result = {
+        "roster_size": len(roster),
+        "position_counts": counts,
+        "unavailable": unavailable,
+    }
+
+    if position:
+        focus = [p for p in roster if p.get("position") == position]
+        result["focus_position"] = position
+        result["focus_players"] = [
+            _non_none({
+                "name": p.get("name"),
+                "slot": p.get("lineup_slot"),
+                "injury_status": p.get("injury_status"),
+                "can_play": (p.get("availability") or {}).get("can_play_this_week"),
+                "risk": (p.get("availability") or {}).get("risk_level"),
+                "bye": bool(p.get("is_on_bye") or p.get("espn_on_bye")),
+                "espn_proj": p.get("espn_projected_points"),
+                "fp_proj": p.get("fp_points") if p.get("fp_points") is not None else p.get("fp_ppr"),
+            })
+            for p in focus
+        ]
+
+    return result
+
+
+def _prefetch_evidence(user_message, turn_context=None):
+    """Do deterministic obvious tool work before Claude to avoid a tool-selection API call."""
+    turn_context = turn_context or _derive_turn_context(user_message)
+    intent = turn_context.get("effective_intent") or _intent_for_message(user_message)
+
+    try:
+        if intent in {"acquisition_compare", "weekly_acquisition_compare", "ros_acquisition_compare"}:
+            comparison = _prefetch_acquisition_compare(turn_context)
+            if comparison is not None:
+                return comparison
+
+        if intent == "waiver":
+            position = _extract_requested_position(user_message) or turn_context.get("position")
+            requested_count = max(
+                _extract_requested_add_count(user_message),
+                int(turn_context.get("requested_add_count") or 1),
+            )
+            # Specific-position requests deserve enough rich evidence to choose the
+            # requested number of adds, with a few alternatives for comparison.
+            waiver = tool_get_waiver_recommendations(
+                position=position,
+                limit=max(5, min(7, requested_count + 3)) if position else 2,
+            )
+            normalized_message = normalize_name(user_message)
+            open_spot = bool(turn_context.get("open_spot")) or any(
+                phrase in normalized_message
+                for phrase in ("empty bench", "empty spot", "open bench", "open spot")
+            )
+            compact_waiver = {
+                "requested_position": waiver.get("requested_position"),
+                "matching_candidates_loaded": waiver.get("matching_candidates_loaded"),
+                "candidate_pool": waiver.get("candidate_pool") or [],
+                "transaction_model_result": waiver.get("transaction_model_result"),
+            }
+            if not open_spot:
+                compact_waiver["moves"] = (waiver.get("moves") or [])[:3]
+            return {
+                "intent": "waiver",
+                "week": _current_week(),
+                "requested_add_count": requested_count,
+                "user_reports_open_spot": open_spot,
+                "waivers": compact_waiver,
+                "roster_context": _compact_roster_need(position),
+                "instruction": (
+                    "Use roster_context when judging team need. If it is present, do not "
+                    "say the roster is unavailable. Choose the requested number of players "
+                    "from candidate_pool when the user asks for multiple adds."
+                ),
+            }
+
+        names = _extract_player_names(user_message, max_players=2)
+        if not names:
+            names = list(turn_context.get("players") or [])[:2]
+
+        if intent == "weekly" and len(names) >= 2:
+            result = tool_compare_players_weekly(names[0], names[1])
+            return {
+                "intent": "weekly_compare",
+                "week": _current_week(),
+                "comparison": {
+                    key: result.get(key)
+                    for key in (
+                        "success", "comparison_status", "player_a", "player_b",
+                        "advisory_score_comparison",
+                    )
+                },
+            }
+
+        if intent == "ros" and len(names) >= 2:
+            result = tool_compare_players_ros(names[0], names[1])
+            return {
+                "intent": "ros_compare",
+                "comparison": {
+                    key: result.get(key)
+                    for key in (
+                        "success", "comparison_status", "player_a", "player_b",
+                        "advisory_score_comparison",
+                    )
+                },
+            }
+
+        if intent == "ml" and names:
+            return {
+                "intent": "shadow_ml",
+                "week": _current_week(),
+                "result": tool_get_shadow_prediction(names[0]),
+            }
+
+        if intent == "stats" and names:
+            player = find_player(names[0])
+            if player is not None:
+                return {
+                    "intent": "actual_stats",
+                    "week": _current_week(),
+                    "player": player.get("name"),
+                    "actual_performance": _actual_performance_context(player),
+                    "current_status": _non_none({
+                        "injury_status": player.get("injury_status"),
+                        "availability": player.get("availability"),
+                        "free_fallback": _compact_free_for_decision(player),
+                    }),
+                }
+
+        if intent == "lineup":
+            return {
+                "intent": "lineup",
+                "week": _current_week(),
+                "optimized": tool_get_optimal_lineup(),
+            }
+
+    except Exception as exc:
+        # Prefetch is an optimization only. Normal Claude tool use remains the
+        # correctness fallback if local intent parsing/tool execution fails.
+        return None
+
+    return None
+
+
+def _needs_chat_history(user_message):
+    text = normalize_name(user_message)
+    followups = (
+        "what about", "how about", "instead", "same question", "that one",
+        "those", "earlier", "last answer", "your answer", "why did", "why was",
+    )
+    if any(term in text for term in followups):
+        return True
+    if text.startswith(("no ", "yes ", "but ", "and ")):
+        return True
+    # Very short turns are often follow-ups such as "what about adams?"
+    return len(text.split()) <= 4
+
+
+def _effort_for_message(user_message):
+    intent = _intent_for_message(user_message)
+    # Very short context-only follow-ups such as "I am thinking long term" still
+    # become real decisions after structured context carryover, so medium is useful.
+    if intent in {"weekly", "ros", "waiver", "lineup"}:
+        return CLAUDE_DECISION_EFFORT
+    if DECISION_CONTEXT.get("players") and _needs_chat_history(user_message):
+        return CLAUDE_DECISION_EFFORT
+    return CLAUDE_SIMPLE_EFFORT
 
 # ==================================================
 # Dispatcher
@@ -1260,7 +2409,10 @@ def run_tool(tool_name, tool_input):
     if tool_name == "get_optimal_lineup":
         return tool_get_optimal_lineup()
     if tool_name == "get_waiver_recommendations":
-        return tool_get_waiver_recommendations()
+        return tool_get_waiver_recommendations(
+            position=tool_input.get("position"),
+            limit=tool_input.get("limit", 5),
+        )
     if tool_name == "get_shadow_prediction":
         return tool_get_shadow_prediction(tool_input.get("player_name", ""))
     if tool_name == "get_system_status":
@@ -1273,18 +2425,41 @@ def run_tool(tool_name, tool_input):
 # Claude tool loop
 # ==================================================
 
-def create_claude_message(messages, tools):
-    return client.messages.create(
-        model=MODEL,
-        max_tokens=1400,
-        system=SYSTEM_PROMPT,
-        messages=messages,
-        tools=tools,
-        tool_choice={"type": "auto"},
-        thinking={"type": "adaptive"},
-        output_config={"effort": CLAUDE_EFFORT},
+def _is_waiver_query(user_message):
+    text = normalize_name(user_message)
+    return any(
+        term in text
+        for term in (
+            "waiver", "pickup", "pick up", "add", "drop",
+            "free agent", "streamer",
+        )
     )
 
+
+def _response_token_budget(user_message):
+    intent = _intent_for_message(user_message)
+    if intent == "waiver":
+        return max(CLAUDE_MAX_TOKENS, CLAUDE_WAIVER_MAX_TOKENS)
+    if intent in {"weekly", "ros", "lineup"}:
+        return CLAUDE_MAX_TOKENS
+    if DECISION_CONTEXT.get("players") and _needs_chat_history(user_message):
+        return min(CLAUDE_MAX_TOKENS, 1800)
+    return min(CLAUDE_MAX_TOKENS, CLAUDE_SIMPLE_MAX_TOKENS)
+
+
+def create_claude_message(messages, tools, max_tokens, effort):
+    kwargs = {
+        "model": MODEL,
+        "max_tokens": max_tokens,
+        "system": SYSTEM_PROMPT,
+        "messages": messages,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort},
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = {"type": "auto"}
+    return client.messages.create(**kwargs)
 
 def serialize_content_blocks(blocks):
     serialized = []
@@ -1305,11 +2480,49 @@ def extract_text(response):
 
 
 def ask_claude(user_message):
-    working_messages = CHAT_HISTORY[-MAX_HISTORY_MESSAGES:] + [
-        {"role": "user", "content": user_message}
+    turn_context = _derive_turn_context(user_message)
+    prefetched = _prefetch_evidence(user_message, turn_context=turn_context)
+    if prefetched is not None:
+        prefetched["league_context"] = _compact_league_context()
+
+    # If deterministic prefetch already resolved the players/horizon, old prose history
+    # is redundant and expensive. Keep history only when Claude truly needs it to infer
+    # the follow-up itself.
+    use_history = _needs_chat_history(user_message) and prefetched is None
+    history = CHAT_HISTORY[-MAX_HISTORY_MESSAGES:] if use_history else []
+
+    if prefetched is not None:
+        context_note = _non_none({
+            "players": turn_context.get("players") or None,
+            "horizon": turn_context.get("horizon"),
+            "acquisition": turn_context.get("acquisition"),
+            "open_spot": turn_context.get("open_spot"),
+            "position": turn_context.get("position"),
+        })
+        current_content = (
+            user_message
+            + "\n\nCONVERSATION DECISION CONTEXT:\n"
+            + json_text(context_note)
+            + "\n\nPREFETCHED APP EVIDENCE (generated by the fantasy app; current factual input):\n"
+            + json_text(prefetched)
+        )
+        # The obvious factual work is already done locally. Omitting tool schemas
+        # here avoids paying for a tool-selection round and repeated schemas.
+        selected_tools = []
+    else:
+        current_content = (
+            user_message
+            + "\n\nLEAGUE CONTEXT (ESPN-derived; authoritative):\n"
+            + json_text(_compact_league_context())
+        )
+        selected_tools = select_tools_for_message(user_message)
+
+    working_messages = history + [
+        {"role": "user", "content": current_content}
     ]
 
-    selected_tools = select_tools_for_message(user_message)
+    token_budget = _response_token_budget(user_message)
+    effort = _effort_for_message(user_message)
 
     total_input_tokens = 0
     total_output_tokens = 0
@@ -1317,14 +2530,48 @@ def ask_claude(user_message):
     final_response = None
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = create_claude_message(working_messages, selected_tools)
-        final_response = response
+        response = create_claude_message(
+            working_messages,
+            selected_tools,
+            max_tokens=token_budget,
+            effort=effort,
+        )
         api_calls += 1
 
         usage = getattr(response, "usage", None)
         if usage is not None:
             total_input_tokens += getattr(usage, "input_tokens", 0) or 0
             total_output_tokens += getattr(usage, "output_tokens", 0) or 0
+
+        # Cost-aware retry: if Claude used the whole budget only for hidden
+        # thinking and produced no visible answer, retry once with more room.
+        # If usable visible text exists, keep it rather than paying for a full
+        # duplicate call merely to finish a sentence or two.
+        if response.stop_reason == "max_tokens":
+            partial = extract_text(response)
+            if partial:
+                final_response = response
+                break
+
+            retry_budget = max(CLAUDE_RETRY_MAX_TOKENS, token_budget * 2)
+            print(
+                f"[Claude] No visible answer before token cap; retrying once "
+                f"with {retry_budget:,} tokens..."
+            )
+            response = create_claude_message(
+                working_messages,
+                selected_tools,
+                max_tokens=retry_budget,
+                effort=effort,
+            )
+            api_calls += 1
+
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                total_input_tokens += getattr(usage, "input_tokens", 0) or 0
+                total_output_tokens += getattr(usage, "output_tokens", 0) or 0
+
+        final_response = response
 
         tool_blocks = [
             block
@@ -1341,10 +2588,15 @@ def ask_claude(user_message):
         })
 
         tool_results = []
-
         for block in tool_blocks:
             try:
                 result = run_tool(block.name, block.input)
+                _update_turn_context_from_tool(
+                    turn_context,
+                    block.name,
+                    block.input,
+                    result,
+                )
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -1369,23 +2621,26 @@ def ask_claude(user_message):
     if final_response.stop_reason == "tool_use":
         raise RuntimeError("Claude exceeded the maximum number of tool rounds.")
 
-    if final_response.stop_reason == "max_tokens":
-        raise RuntimeError("Claude reached max_tokens before finishing.")
-
     response_text = extract_text(final_response)
     if not response_text:
-        response_text = "Claude returned no text response."
+        raise RuntimeError("Claude returned no text response.")
+
+    if final_response.stop_reason == "max_tokens":
+        response_text += "\n\n[Answer reached the response-token cap.]"
 
     print("\nCoach: " + response_text)
     print(
         "\n"
         f"[Claude usage: {total_input_tokens:,} input / "
         f"{total_output_tokens:,} output tokens across {api_calls} API call"
-        f"{'' if api_calls == 1 else 's'}]"
+        f"{'' if api_calls == 1 else 's'}; "
+        f"prefetch={'yes' if prefetched is not None else 'no'}; effort={effort}]"
     )
 
+    # Store only the human-visible conversation, never bulky prefetched JSON.
     CHAT_HISTORY.append({"role": "user", "content": user_message})
     CHAT_HISTORY.append({"role": "assistant", "content": response_text})
+    _persist_turn_context(turn_context)
 
     return response_text
 
@@ -1420,6 +2675,13 @@ def load_app_context():
         f"Week {APP_CONTEXT.get('current_week')}."
     )
 
+    scoring = _compact_league_context()
+    print(
+        "League scoring: "
+        f"{scoring.get('scoring', 'UNKNOWN')} "
+        f"({scoring.get('reception_points')} pts/reception)."
+    )
+
 
 # ==================================================
 # CLI
@@ -1428,7 +2690,7 @@ def load_app_context():
 def main():
     load_app_context()
 
-    print(f"\nFantasy Coach ready ({MODEL}, effort={CLAUDE_EFFORT}).")
+    print(f"\nFantasy Coach {APP_VERSION} ready ({MODEL}, effort={CLAUDE_EFFORT}).")
     print(
         "Claude can use roster, arbitrary-player lookup, player comparisons, "
         "lineup, waivers, and shadow-ML tools."
@@ -1454,6 +2716,7 @@ def main():
             try:
                 EXTERNAL_PLAYER_CACHE.clear()
                 CHAT_HISTORY.clear()
+                _reset_decision_context()
                 load_app_context()
                 print("Fantasy data refreshed. Conversation history cleared.")
             except Exception as exc:
