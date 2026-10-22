@@ -7,6 +7,8 @@ export interface Player {
   espn_projection?: number | null
   fantasypros_projection?: number | null
   weekly_score_advisory?: number | null
+  lineup_projection?: number | null
+  lineup_projection_sources?: string[]
   ros_score_advisory?: number | null
   injury_status?: string | null
   on_bye_week?: boolean
@@ -33,6 +35,9 @@ export interface LineupData {
   week: number
   lineup: Record<string, Player | null>
   projected_total: number | null
+  selection_method?: string
+  projection_complete?: boolean
+  projection_coverage?: string
 }
 
 export interface CoachReply {

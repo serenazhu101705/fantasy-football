@@ -83,7 +83,7 @@ DECISION_CONTEXT = {
 MAX_HISTORY_MESSAGES = 2
 MAX_TOOL_ROUNDS = 4
 SEASON = 2026
-APP_VERSION = "v7.8"
+APP_VERSION = "v7.10"
 
 
 def _debug_enabled():
@@ -160,6 +160,11 @@ current player/league claim; never invent current facts.
 Core rules:
 - OUT/IR/bye/roster status/lineup legality and supplied provider facts are binding.
 - weekly_score, ros_score, optimizer output, and deterministic winners are ADVISORY.
+  The weekly optimizer primarily uses ESPN + FantasyPros projected points (using
+  available sources), with weekly_score only a small tie-breaker. For starting
+  lineup advice, use that same projection baseline. If recommending a different
+  lineup, explicitly identify the changed player, why, and the injury/role/news
+  evidence strong enough to override the baseline; never silently contradict it.
   Make the final judgment from projections, rankings, actual role/volume/production,
   health/practice, matchup, market signals, and shadow ML as relevant.
 - nflverse actual_performance is factual completed-game evidence. Explained BYE,
@@ -1224,6 +1229,16 @@ def tool_compare_players_ros(player_a, player_b):
     }
 
 
+def _lineup_projected_points(player):
+    from lineup_optimizer import projected_points
+    return projected_points(player)
+
+
+def _lineup_projection_sources(player):
+    from lineup_optimizer import projection_sources
+    return projection_sources(player)
+
+
 def tool_get_optimal_lineup():
     optimized = APP_CONTEXT.get("optimized") or {}
     lineup = optimized.get("lineup") or {}
@@ -1234,11 +1249,21 @@ def tool_get_optimal_lineup():
             str(slot): (
                 None
                 if player is None
-                else compact_player(player, include_shadow=False, include_matchup=False, include_free=False, include_actual=False)
+                else {
+                    **compact_player(player, include_shadow=False, include_matchup=False, include_free=False, include_actual=False),
+                    "lineup_projection": (
+                        round(_lineup_projected_points(player), 2)
+                        if _lineup_projection_sources(player) else None
+                    ),
+                    "lineup_projection_sources": list(_lineup_projection_sources(player)),
+                }
             )
             for slot, player in lineup.items()
         },
         "projected_total": optimized.get("projected_total"),
+        "projection_complete": optimized.get("projection_complete"),
+        "projection_coverage": optimized.get("projection_coverage"),
+        "selection_method": optimized.get("selection_method"),
         "weekly_lineup_value": optimized.get("lineup_score"),
     }
 

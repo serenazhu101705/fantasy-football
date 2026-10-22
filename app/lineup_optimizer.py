@@ -1,271 +1,158 @@
+"""Legal weekly lineup selection using available league-scoring projections.
+
+ESPN and FantasyPros projections are already expressed in the league's scoring
+format by the enrichment layer. Missing providers are not treated as zero-point
+projections. The older composite ``weekly_score`` remains advisory, rather than
+being allowed to overrule a large, observable difference in projected points.
+"""
+
 from itertools import combinations
+from math import isfinite
 
 
-def lineup_value(player):
-    """
-    Value used to choose the best weekly lineup.
+def _number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+        return value if isfinite(value) else None
+    except (ValueError, TypeError):
+        return None
 
-    This is our combined weekly decision score from
-    player_value.py, NOT projected fantasy points.
-    """
 
+def projection_sources(player):
+    """Provider projections known at decision time (no generated estimates)."""
     if player is None:
-        return 0.0
-
-    value = player.get("weekly_score")
-
-    if value is None:
-        return 0.0
-
-    return float(value)
+        return {}
+    sources = {}
+    espn = _number(player.get("espn_projected_points"))
+    fantasypros = _number(player.get("fp_points"))
+    if fantasypros is None:
+        fantasypros = _number(player.get("fp_ppr"))
+    if espn is not None:
+        sources["ESPN"] = espn
+    if fantasypros is not None:
+        sources["FantasyPros"] = fantasypros
+    return sources
 
 
 def projected_points(player):
-    """
-    FantasyPros projected points in the ESPN league's reception format.
+    """Mean available provider projections; no missing-source zero penalty.
 
-    We do NOT use this to choose the lineup anymore.
-    We keep it so we can report the expected fantasy
-    point total of the recommended lineup.
+    Standalone by design: older offline tests extract this function directly.
     """
-
     if player is None:
         return 0.0
 
-    value = player.get("fp_points")
-    if value is None:
-        value = player.get("fp_ppr")
+    def valid_number(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+            return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+        except (ValueError, TypeError):
+            return None
 
-    if value is None:
+    espn = valid_number(player.get("espn_projected_points"))
+    fp = valid_number(player.get("fp_points"))
+    if fp is None:
+        fp = valid_number(player.get("fp_ppr"))
+    known = [value for value in (espn, fp) if value is not None]
+    return sum(known) / len(known) if known else 0.0
+
+
+def weekly_advisory_value(player):
+    if player is None:
         return 0.0
+    return _number(player.get("weekly_score")) or 0.0
 
-    return float(value)
+
+def lineup_value(player):
+    """Points-first selection score; advisory can break only near-ties.
+
+    The composite's maximum contribution is 0.50 projected points, so it cannot
+    put a significantly lower-projected WR ahead of a healthy proven starter.
+    When ALL projection sources are missing for a player, use a visibly marked
+    advisory proxy to avoid pretending an absent projection is a measured zero.
+    """
+    if player is None:
+        return 0.0
+    advisory = weekly_advisory_value(player)
+    if not projection_sources(player):
+        return advisory * 0.10
+    return projected_points(player) + min(0.50, max(0.0, advisory) * 0.005)
 
 
 def is_available(player):
-    """
-    Determine whether a player can reasonably be
-    considered for the starting lineup.
-
-    Questionable players are still allowed because
-    they may play.
-
-    OUT and IR players are excluded.
-    """
-
-    availability = (
-        player.get("availability")
-        or {}
-    )
-
-    return availability.get(
-        "can_play_this_week",
-        True,
-    )
+    availability = player.get("availability") or {}
+    return bool(availability.get("can_play_this_week", True))
 
 
 def best_player(players):
-    """
-    Return the player with the highest weekly value.
-    """
-
-    if not players:
-        return None
-
-    return max(
-        players,
-        key=lineup_value,
-    )
+    return max(players, key=lineup_value) if players else None
 
 
 def optimize_lineup(roster):
+    """Optimize 1 QB, 2 RB, 2 WR, 1 TE, 1 FLEX, 1 DST, 1 K.
+
+    Return the old weekly lineup score for waiver transaction compatibility.
+    ``selection_score`` is the new points-first objective, while the displayed
+    ``projected_total`` is a projection-only consensus (never weekly_score).
     """
-    Find the highest-value legal weekly lineup.
+    available = [p for p in roster if is_available(p)]
+    groups = {
+        position: [p for p in available if p.get("position") == position]
+        for position in ("QB", "RB", "WR", "TE", "D/ST", "K")
+    }
+    empty = {
+        "lineup": None,
+        "lineup_score": 0.0,
+        "selection_score": 0.0,
+        "projected_total": 0.0,
+        "projection_complete": False,
+        "projection_coverage": "0/9",
+        "selection_method": "projection_consensus_with_advisory_tiebreak",
+    }
+    if any(len(groups[position]) < required for position, required in
+           (("QB", 1), ("RB", 2), ("WR", 2), ("TE", 1), ("D/ST", 1), ("K", 1))):
+        return empty
 
-    Current league assumptions:
-
-        1 QB
-        2 RB
-        2 WR
-        1 TE
-        1 FLEX (RB/WR/TE)
-        1 D/ST
-        1 K
-
-    Players are selected using weekly_score.
-
-    We separately calculate FantasyPros projected
-    fantasy points for display.
-    """
-
-    # --------------------------------------------------
-    # Remove unavailable players
-    # --------------------------------------------------
-
-    available = [
-        player
-        for player in roster
-        if is_available(player)
-    ]
-
-    # --------------------------------------------------
-    # Group by position
-    # --------------------------------------------------
-
-    qbs = [
-        player
-        for player in available
-        if player["position"] == "QB"
-    ]
-
-    rbs = [
-        player
-        for player in available
-        if player["position"] == "RB"
-    ]
-
-    wrs = [
-        player
-        for player in available
-        if player["position"] == "WR"
-    ]
-
-    tes = [
-        player
-        for player in available
-        if player["position"] == "TE"
-    ]
-
-    dsts = [
-        player
-        for player in available
-        if player["position"] == "D/ST"
-    ]
-
-    kickers = [
-        player
-        for player in available
-        if player["position"] == "K"
-    ]
-
-    # --------------------------------------------------
-    # Make sure a legal lineup is possible
-    # --------------------------------------------------
-
-    if (
-        len(qbs) < 1
-        or len(rbs) < 2
-        or len(wrs) < 2
-        or len(tes) < 1
-        or len(dsts) < 1
-        or len(kickers) < 1
-    ):
-        return {
-            "lineup": None,
-            "lineup_score": 0.0,
-            "projected_total": 0.0,
-        }
-
-    # --------------------------------------------------
-    # QB / DST / K do not interact with FLEX, so we can
-    # choose their best options immediately.
-    # --------------------------------------------------
-
-    qb = best_player(qbs)
-    dst = best_player(dsts)
-    kicker = best_player(kickers)
-
-    # --------------------------------------------------
-    # Search every legal RB / WR / TE / FLEX combination
-    # --------------------------------------------------
-
+    qb = best_player(groups["QB"])
+    dst = best_player(groups["D/ST"])
+    kicker = best_player(groups["K"])
     best_lineup = None
-    best_total = -1.0
+    best_total = float("-inf")
 
-    for rb_combo in combinations(rbs, 2):
-
-        for wr_combo in combinations(wrs, 2):
-
-            for te in tes:
-
-                used_ids = {
-                    player["espn_id"]
-                    for player in (
-                        list(rb_combo)
-                        + list(wr_combo)
-                        + [te]
-                    )
-                }
-
-                # FLEX can be any remaining
-                # RB / WR / TE.
-                flex_candidates = [
-                    player
-                    for player in (
-                        rbs
-                        + wrs
-                        + tes
-                    )
-                    if player["espn_id"]
-                    not in used_ids
+    for rb_combo in combinations(groups["RB"], 2):
+        for wr_combo in combinations(groups["WR"], 2):
+            for te in groups["TE"]:
+                used_ids = {p.get("espn_id", p.get("name")) for p in (*rb_combo, *wr_combo, te)}
+                flex_options = [
+                    p for p in (*groups["RB"], *groups["WR"], *groups["TE"])
+                    if p.get("espn_id", p.get("name")) not in used_ids
                 ]
-
-                flex = best_player(
-                    flex_candidates
-                )
-
+                flex = best_player(flex_options)
                 if flex is None:
                     continue
-
                 lineup = {
-                    "QB": qb,
-                    "RB1": rb_combo[0],
-                    "RB2": rb_combo[1],
-                    "WR1": wr_combo[0],
-                    "WR2": wr_combo[1],
-                    "TE": te,
-                    "FLEX": flex,
-                    "D/ST": dst,
-                    "K": kicker,
+                    "QB": qb, "RB1": rb_combo[0], "RB2": rb_combo[1],
+                    "WR1": wr_combo[0], "WR2": wr_combo[1], "TE": te,
+                    "FLEX": flex, "D/ST": dst, "K": kicker,
                 }
-
-                # This determines which lineup wins.
-                total_value = sum(
-                    lineup_value(player)
-                    for player
-                    in lineup.values()
-                )
-
-                if total_value > best_total:
-                    best_total = total_value
-                    best_lineup = lineup
-
-    # --------------------------------------------------
-    # Calculate actual projected fantasy points
-    # separately from our decision score.
-    # --------------------------------------------------
+                total = sum(lineup_value(p) for p in lineup.values())
+                if total > best_total:
+                    best_total, best_lineup = total, lineup
 
     if best_lineup is None:
-        return {
-            "lineup": None,
-            "lineup_score": 0.0,
-            "projected_total": 0.0,
-        }
-
-    projected_total = sum(
-        projected_points(player)
-        for player
-        in best_lineup.values()
-    )
-
+        return empty
+    players = list(best_lineup.values())
+    available_projections = sum(bool(projection_sources(p)) for p in players)
     return {
         "lineup": best_lineup,
-        "lineup_score": round(
-            best_total,
-            2,
-        ),
-        "projected_total": round(
-            projected_total,
-            2,
-        ),
+        "lineup_score": round(sum(weekly_advisory_value(p) for p in players), 2),
+        "selection_score": round(best_total, 2),
+        "projected_total": round(sum(projected_points(p) for p in players), 2),
+        "projection_complete": available_projections == len(players),
+        "projection_coverage": f"{available_projections}/{len(players)}",
+        "selection_method": "projection_consensus_with_advisory_tiebreak",
     }
