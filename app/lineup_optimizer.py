@@ -22,7 +22,7 @@ def lineup_value(player):
 
 def projected_points(player):
     """
-    Actual FantasyPros projected PPR points.
+    FantasyPros projected points in the ESPN league's reception format.
 
     We do NOT use this to choose the lineup anymore.
     We keep it so we can report the expected fantasy
@@ -32,7 +32,9 @@ def projected_points(player):
     if player is None:
         return 0.0
 
-    value = player.get("fp_ppr")
+    value = player.get("fp_points")
+    if value is None:
+        value = player.get("fp_ppr")
 
     if value is None:
         return 0.0

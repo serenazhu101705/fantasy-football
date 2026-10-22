@@ -24,33 +24,43 @@ def load_snapshot(season, week):
         return json.load(file), path
 
 
-def get_actual_points(season, week):
-    """
-    Get actual PPR fantasy points for the completed week.
+def _league_points_from_nflverse(row, reception_points):
+    """Reception-adjust standard NFL points; other custom ESPN scoring is not modeled."""
+    catches = float(row.get("receptions") or 0)
+    standard = row.get("fantasy_points")
+    if standard is not None:
+        return float(standard) + catches * reception_points
+    ppr = row.get("fantasy_points_ppr")
+    if ppr is None:
+        return None
+    return float(ppr) + catches * (reception_points - 1.0)
 
-    This currently covers offensive players from nflverse.
-    K and D/ST will be handled separately later.
-    """
 
-    stats = nfl.load_player_stats(
-        seasons=[season],
-        summary_level="week",
-    )
+def _snapshot_scoring(snapshot):
+    """Freeze scoring from pregame snapshot, never recompute using today's league."""
+    stored = snapshot.get("league_scoring")
+    if stored is None:
+        # Older decision_history snapshots were recorded in full-PPR units.
+        return {"scoring_label": "LEGACY_PPR", "reception_points": 1.0}
+    points = stored.get("reception_points")
+    if points is None:
+        raise RuntimeError(
+            "Snapshot reception scoring was UNKNOWN. Refusing to silently "
+            "evaluate as PPR; obtain the historical ESPN scoring rules first."
+        )
+    return {"scoring_label": stored.get("scoring_label", "CUSTOM"),
+            "reception_points": float(points)}
 
-    week_stats = stats.filter(
-        pl.col("week") == week
-    )
 
+def get_actual_points(season, week, reception_points=1.0):
+    """Get completed offensive results in the snapshot's reception scoring."""
+    stats = nfl.load_player_stats(seasons=[season], summary_level="week")
+    week_stats = stats.filter(pl.col("week") == week)
     points = {}
-
     for row in week_stats.iter_rows(named=True):
         name = row.get("player_display_name")
-
-        if not name:
-            continue
-
-        points[name] = row.get("fantasy_points_ppr")
-
+        if name:
+            points[name] = _league_points_from_nflverse(row, reception_points)
     return points
 
 
@@ -226,7 +236,9 @@ def projected_value(player):
     if player is None:
         return 0.0
 
-    value = player.get("projection_ppr")
+    value = player.get("projection_points")
+    if value is None:
+        value = player.get("projection_ppr")
 
     if value is None:
         return 0.0
@@ -255,7 +267,9 @@ def recent_ppr(player):
 
     usage = player.get("recent_usage") or {}
 
-    value = usage.get("ppr_points_per_game")
+    value = usage.get("fantasy_points_per_game")
+    if value is None:
+        value = usage.get("ppr_points_per_game")
 
     if value is None:
         return None
@@ -386,9 +400,9 @@ def evaluate_week(season, week):
         week,
     )
 
+    scoring = _snapshot_scoring(snapshot)
     actual_points = get_actual_points(
-        season,
-        week,
+        season, week, reception_points=scoring["reception_points"],
     )
 
     # --------------------------------------------------
@@ -583,6 +597,8 @@ def evaluate_week(season, week):
     )
 
     evaluation = {
+        "scoring": scoring,
+        "points_scope": "nflverse reception-adjusted standard; other custom ESPN bonuses not modeled",
         "recommended_skill_position_actual":
             round(
                 recommended_actual_total,

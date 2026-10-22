@@ -182,10 +182,11 @@ def build_player_snapshot(
         # Forward-looking weekly information
         # ------------------------------------------
 
-        "projection":
-            player.get(
-                "fp_ppr"
-            ),
+        "projection": (
+            player.get("fp_points")
+            if player.get("fp_points") is not None
+            else player.get("fp_ppr")
+        ),
 
         "projection_source":
             player.get(
@@ -206,10 +207,12 @@ def build_player_snapshot(
         # Recent production / usage
         # ------------------------------------------
 
-        "recent_ppr":
-            usage.get(
-                "ppr_points_per_game"
-            ),
+        "recent_ppr": usage.get("ppr_points_per_game"),  # legacy field
+        "recent_fantasy_points": (
+            usage.get("fantasy_points_per_game")
+            if usage.get("fantasy_points_per_game") is not None
+            else usage.get("ppr_points_per_game")
+        ),
 
         "recent_opportunity":
             _get_usage_value(

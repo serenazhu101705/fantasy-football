@@ -34,8 +34,11 @@ def player_snapshot(player):
         # Weekly value
         # ----------------------------------------------
 
-        "projection_ppr": player.get(
-            "fp_ppr"
+        "projection_ppr": player.get("fp_ppr"),  # legacy compatibility
+        "projection_points": (
+            player.get("fp_points")
+            if player.get("fp_points") is not None
+            else player.get("espn_projected_points")
         ),
 
         "weekly_ecr": player.get(
@@ -129,6 +132,7 @@ def save_weekly_snapshot(
     roster,
     optimized,
     comparison=None,
+    league_settings=None,
 ):
     """
     Freeze the information the model knew when the
@@ -166,6 +170,11 @@ def save_weekly_snapshot(
         ).isoformat(),
 
         "decision_type": "weekly_lineup",
+        "league_scoring": {
+            "scoring_label": (league_settings or {}).get("scoring_label", "UNKNOWN"),
+            "reception_points": (league_settings or {}).get("reception_points"),
+            "nflverse_points_scope": (league_settings or {}).get("nflverse_points_scope"),
+        },
 
         "projected_total": optimized.get(
             "projected_total"

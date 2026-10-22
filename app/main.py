@@ -1289,6 +1289,7 @@ def main():
             roster=roster,
             optimized=optimized,
             comparison=None,
+            league_settings=league_settings,
         )
 
         print(

@@ -1529,3 +1529,38 @@ def rank_transactions(
         key=transaction_priority,
         reverse=True,
     )
+
+# ==================================================
+# Empty-bench-spot advisory (no drop required)
+# ==================================================
+
+def evaluate_open_slot_add(roster, add_player):
+    """Evaluate a standalone ADD, without treating a hypothetical DROP as mandatory.
+
+    This is an advisory snapshot for an explicitly open roster spot. Actual ESPN
+    roster legality and acquisition are handled by ESPN, not this helper.
+    """
+    current = optimize_lineup(roster)
+    after_roster = [deepcopy(p) for p in roster] + [deepcopy(add_player)]
+    updated = optimize_lineup(after_roster)
+    balance = evaluate_roster_balance(roster, after_roster)
+
+    def difference(key):
+        before_value = current.get(key)
+        after_value = updated.get(key)
+        if before_value is None or after_value is None:
+            return None
+        return round(float(after_value) - float(before_value), 2)
+
+    return {
+        "add": add_player.get("name"),
+        "position": add_player.get("position"),
+        "drop": None,
+        "needs_drop": False,
+        "valid_lineup_after": has_complete_lineup(updated),
+        "weekly_lineup_delta_advisory": difference("lineup_score"),
+        "projected_points_delta": difference("projected_total"),
+        "roster_balance_delta_advisory": balance.get("balance_delta"),
+        "ros_score_advisory": add_player.get("ros_score"),
+        "reason": "No rostered player must be dropped for this hypothetical open-slot add.",
+    }
