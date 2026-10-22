@@ -44,6 +44,7 @@ def load_functions(filename, names, injected=None):
 ROUTER_FUNCTIONS = [
     'normalize_name', 'json_text', '_non_none', '_debug_enabled', '_trace', '_evidence_sources',
     '_has_ros_cue', '_asks_league_scoring', '_is_roster_review',
+    '_is_matchup_strategy_query', '_is_league_data_query',
     '_looks_like_waiver_acquisition', '_mentions_open_spot',
     '_is_waiver_replacement_request', '_is_fresh_waiver_request', '_waiver_drop_name', '_intent_for_message',
     '_extract_requested_position', '_extract_requested_add_count',
@@ -112,6 +113,57 @@ class RouterRegressionTests(unittest.TestCase):
 
     def call(self, name, *args, **kwargs):
         return self.scope[name](*args, **kwargs)
+
+    def test_matchup_strategy_clears_prior_comparison(self):
+        self.call('_derive_turn_context', 'tucker or worthy')
+        self.scope['DECISION_CONTEXT']['players'] = ['Tre Tucker', 'Xavier Worthy']
+        ctx = self.call('_derive_turn_context', 'am i favored and by how much this week?')
+        self.assertEqual(ctx['effective_intent'], 'matchup_strategy')
+        self.assertEqual(ctx['players'], [])
+        self.assertEqual(ctx['horizon'], None)
+        self.assertEqual(self.call('_intent_for_message', 'what do i need to do to win this week'), 'matchup_strategy')
+        self.assertEqual(self.call('_intent_for_message', 'how much do i need to beat my projections by'), 'matchup_strategy')
+
+    def test_matchup_question_uses_espn_evidence_one_claude_call(self):
+        context = self.scope['APP_CONTEXT']
+        context.update({
+            'league': object(), 'team': types.SimpleNamespace(team_id=1),
+            'roster': [{'name': 'Roster WR', 'position': 'WR'}],
+            'waiver_candidates': [{'name': 'Available WR', 'position': 'WR',
+                                    'espn_projected_points': 11}],
+        })
+        self.scope['matchup_strategy'] = lambda league, team_id, week: {
+            'status': 'available', 'week': week, 'projected_margin': -9.5,
+            'extra_points_above_my_projection_to_take_lead': 9.51,
+            'my_team': {'team_id':1, 'name':'Mine', 'projected_final':100,
+                        'roster':[{'name':'Roster WR', 'position':'WR', 'slot':'WR',
+                                   'projected_points':12,'starter':True}]},
+            'opponent': {'team_id':2, 'name':'Opp', 'projected_final':109.5,
+                         'roster':[{'name':'Their WR','position':'WR','slot':'WR',
+                                    'projected_points':16,'starter':True}]},
+            'possible_lineup_upgrades':[],
+        }
+        fake = types.SimpleNamespace(
+            stop_reason='end_turn', usage=types.SimpleNamespace(input_tokens=900,output_tokens=90),
+            content=[types.SimpleNamespace(type='text',text='Projected behind by 9.5 points.')],
+        )
+        calls = Mock(return_value=fake)
+        self.scope['create_claude_message'] = calls
+        with contextlib.redirect_stdout(io.StringIO()):
+            reply = self.call('ask_claude', 'am i favored and by how much?')
+        self.assertIn('9.5', reply)
+        calls.assert_called_once()
+        self.assertEqual(calls.call_args.args[1], [])
+        self.assertIn('projected_margin', str(calls.call_args))
+        self.assertIn('Available WR', str(calls.call_args))
+        self.assertEqual(self.scope['DECISION_CONTEXT']['players'], [])
+
+    def test_league_data_clears_prior_waiver(self):
+        self.scope['DECISION_CONTEXT']['waiver_drop_target'] = 'Tre Tucker'
+        ctx = self.call('_derive_turn_context', 'how much FAAB does everyone have')
+        self.assertEqual(ctx['effective_intent'], 'league_data')
+        self.assertEqual(ctx['waiver_drop_target'], None)
+        self.assertEqual(ctx['players'], [])
 
     def test_two_player_comparison_prefetches(self):
         ctx = self.call('_derive_turn_context', 'tucker or worthy')

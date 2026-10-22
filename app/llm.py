@@ -24,6 +24,8 @@ from free_fantasy_sources import get_free_fallback_signals
 from actual_performance import get_actual_performance
 from league_settings import get_league_scoring_context, reception_points_or_default
 from recommendation_journal import choice_instruction, extract_choice, create_record, save_record
+from league_intelligence import (matchup_strategy, standings as league_standings,
+    faab as league_faab, schedule as league_schedule, team_roster as league_team_roster)
 
 
 # ==================================================
@@ -83,7 +85,7 @@ DECISION_CONTEXT = {
 MAX_HISTORY_MESSAGES = 2
 MAX_TOOL_ROUNDS = 4
 SEASON = 2026
-APP_VERSION = "v7.11"
+APP_VERSION = "v7.12"
 
 
 def _debug_enabled():
@@ -195,6 +197,13 @@ Core rules:
   not switch back to the general waiver pool unless the user asks for other candidates.
 - Treat a surname from the immediately established comparison as that same player; do not
   re-ask which player the user means unless the app evidence itself marks the name ambiguous.
+- For WEEKLY MATCHUP STRATEGY, use ESPN's actual matchup, both starting lineups and
+  projections. A positive projected_margin means favored BY POINTS, not a calibrated
+  win probability. Extra points needed assumes the opponent meets their projection.
+  Do not invent odds or guarantee that a lineup swap is legal after kickoff.
+- For league FAAB, other rosters, standings, and schedule, use current ESPN
+  context. Unprocessed/pending waiver claims are not reliably available here;
+  NEVER say there are zero claims merely because they cannot be retrieved.
 - Do not convert an injury/workload multiplier directly into projected points.
 
 Use PREFETCHED APP EVIDENCE when present; do not call a tool again for facts already
@@ -1692,6 +1701,8 @@ def select_tools_for_message(user_message):
         wanted = set(names)
         return [tool for tool in TOOLS if tool["name"] in wanted]
 
+    if _is_matchup_strategy_query(user_message) or _is_league_data_query(user_message):
+        return []
     if _asks_league_scoring(user_message):
         return pick("get_system_status")
     if _is_roster_review(user_message):
@@ -1803,8 +1814,35 @@ def _waiver_drop_name(user_message, resolved_names):
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _is_matchup_strategy_query(user_message):
+    text = normalize_name(user_message)
+    return bool(re.search(
+        r"\b(?:am i favored|are we favored|win this week|beat my opponent|"
+        r"beat my projection|beat my projections|projected to win|"
+        r"how much (?:do i|should i|would i) (?:need|have) to (?:score|win|beat)|"
+        r"how (?:can|do) i win|my matchup|opponent matchup|"
+        r"what do i need to do to win|what is my opponent projected|"
+        r"who am i playing this week|who do i play this week)\b", text
+    ))
+
+
+def _is_league_data_query(user_message):
+    text = normalize_name(user_message)
+    return bool(re.search(
+        r"\b(?:faab|waiver budget|waiver priority|standings|league schedule|"
+        r"other teams roster|other team roster|opponents roster|opponent roster|"
+        r"opponent s roster|opponents lineup|opponent lineup|pending claims|"
+        r"pending waivers|recent transactions|league transactions|"
+        r"how many wins|who has the most points)\b", text
+    ))
+
+
 def _intent_for_message(user_message):
     text = normalize_name(user_message)
+    if _is_matchup_strategy_query(user_message):
+        return "matchup_strategy"
+    if _is_league_data_query(user_message):
+        return "league_data"
     if _asks_league_scoring(user_message):
         return "league_info"
     if _is_roster_review(user_message):
@@ -2172,6 +2210,13 @@ def _derive_turn_context(user_message):
     context["players"] = list(previous_players)
 
     names = _extract_player_names(user_message, max_players=4)
+    if _is_matchup_strategy_query(user_message) or _is_league_data_query(user_message):
+        # New league-wide questions must not inherit unrelated A-vs-B decisions.
+        context.update({"players": [], "horizon": None, "acquisition": False,
+                        "position": None, "open_spot": False,
+                        "requested_add_count": 1, "waiver_drop_target": None})
+        previous_players = []
+        names = []
     if _is_fresh_waiver_request(user_message, names):
         # Fresh standalone waiver searches override all stale comparison state.
         # Merely setting explicit_intent='waiver' is insufficient: the generic
@@ -2218,6 +2263,11 @@ def _derive_turn_context(user_message):
         context["acquisition"] = True
 
     explicit_intent = _intent_for_message(user_message)
+    if explicit_intent in {"matchup_strategy", "league_data"}:
+        context["horizon"] = None
+        context["acquisition"] = False
+        context["position"] = None
+        context["players"] = []
     players = context.get("players") or []
 
     # Keep drop-vs-available-waivers anchored across corrections and background
@@ -2241,7 +2291,7 @@ def _derive_turn_context(user_message):
             explicit_intent == "weekly"
             and re.search(r"\b(?:who should i start|who do i start|start sit|my starters)\b", normalize_name(user_message))
         )
-        if new_comparison or new_pool_request or new_weekly_question or explicit_intent in {"roster_review", "lineup", "league_info"}:
+        if new_comparison or new_pool_request or new_weekly_question or explicit_intent in {"roster_review", "lineup", "league_info", "matchup_strategy", "league_data"}:
             drop_target = None
 
     if drop_target:
@@ -2456,6 +2506,91 @@ def _prefetch_evidence(user_message, turn_context=None):
     intent = turn_context.get("effective_intent") or _intent_for_message(user_message)
 
     try:
+        if intent == "matchup_strategy":
+            context = APP_CONTEXT or {}
+            league, team = context.get("league"), context.get("team")
+            if league is None or team is None:
+                return {"intent": "matchup_strategy", "status": "unavailable", "reason": "ESPN context missing"}
+            try:
+                result = matchup_strategy(league, team.team_id, _current_week())
+            except Exception as exc:
+                return {"intent": "matchup_strategy", "status": "unavailable",
+                        "reason": f"ESPN matchup could not be loaded ({type(exc).__name__})"}
+            # Compact evidence: never send 2 full 17-player rosters for one question.
+            if result.get("status") == "available":
+                for key in ("my_team", "opponent"):
+                    side = result.get(key) or {}
+                    side["roster"] = [_non_none({"name": p.get("name"), "position": p.get("position"),
+                        "slot": p.get("slot"), "proj": p.get("projected_points"),
+                        "actual": p.get("actual_points"), "injury": p.get("injury_status")})
+                        for p in (side.get("roster") or []) if p.get("starter")]
+                result["possible_lineup_upgrades"] = result.get("possible_lineup_upgrades", [])[:4]
+            roster_names = {normalize_name(p.get("name")) for p in (context.get("roster") or [])}
+            pool = [p for p in (context.get("waiver_candidates") or [])
+                    if normalize_name(p.get("name")) not in roster_names]
+            # The loaded pool is evidence of availability, not a guarantee of
+            # future waiver priority or successful claims.
+            def waiver_week_projection(p):
+                for key in ("espn_projected_points", "fp_points", "fp_ppr"):
+                    try:
+                        value = p.get(key)
+                        if value is not None:
+                            return float(value)
+                    except (ValueError, TypeError):
+                        pass
+                return -1.0
+            pool.sort(key=waiver_week_projection, reverse=True)
+            shortlist = [_non_none({"name": p.get("name"), "position": p.get("position"),
+                         "espn_projection": p.get("espn_projected_points"),
+                         "fp_projection": p.get("fp_points"),
+                         "injury_status": p.get("injury_status")}) for p in pool[:5]]
+            return {"intent": "matchup_strategy", "matchup": result,
+                    "available_waiver_shortlist": shortlist,
+                    "instruction": "Answer projection lead/deficit and points-to-beat numerically from ESPN. "
+                    "Use both lineups and explain highest leverage legal possibilities. "
+                    "Suggest waiver/FAAB moves only from available_waiver_shortlist and verify a legal drop; "
+                    "waiver bids and expected win probability aren't calculated here."}
+
+        if intent == "league_data":
+            context = APP_CONTEXT or {}
+            league, team = context.get("league"), context.get("team")
+            if league is None or team is None:
+                return {"intent": "league_data", "status": "unavailable"}
+            text = normalize_name(user_message)
+            result = {"intent": "league_data", "week": _current_week()}
+            if any(x in text for x in ("faab", "budget", "waiver priority")):
+                result["faab"] = league_faab(league)
+            elif "pending" in text and ("claim" in text or "waiver" in text):
+                result["pending_claims"] = {"status": "not_supported", "note": "Private unprocessed claims are not available from this ESPN integration."}
+            elif "roster" in text or "lineup" in text:
+                try:
+                    opponent = None
+                    if "opponent" in text:
+                        strategy = matchup_strategy(league, team.team_id, _current_week())
+                        opponent = (strategy.get("opponent") or {}).get("team_id")
+                    if opponent is None:
+                        for t in league.teams:
+                            candidate = normalize_name(getattr(t, "team_name", ""))
+                            if candidate and candidate in text:
+                                opponent = t.team_id
+                                break
+                    if opponent is not None:
+                        result["roster"] = league_team_roster(league, opponent, _current_week())
+                    else:
+                        result["available_teams"] = [{"name": t.team_name, "id": t.team_id}
+                                                     for t in league.teams]
+                except Exception as exc:
+                    result["status"] = "unavailable"
+                    result["error"] = f"ESPN roster details unavailable ({type(exc).__name__})"
+            elif "standings" in text or "wins" in text or "most points" in text:
+                result["standings"] = league_standings(league)
+            elif "schedule" in text or "play next" in text:
+                rows = league_schedule(league, team.team_id).get("schedule", [])
+                result["schedule"] = [r for r in rows if r["week"] >= _current_week()][:5]
+            else:
+                result["standings"] = league_standings(league)
+            return result
+
         if intent == "league_info":
             return {"intent": "league_info", "league_context": _compact_league_context()}
 
@@ -2707,7 +2842,7 @@ def _effort_for_message(user_message):
     intent = _intent_for_message(user_message)
     # Very short context-only follow-ups such as "I am thinking long term" still
     # become real decisions after structured context carryover, so medium is useful.
-    if intent in {"weekly", "ros", "waiver", "lineup"}:
+    if intent in {"weekly", "ros", "waiver", "lineup", "matchup_strategy", "league_data"}:
         return CLAUDE_DECISION_EFFORT
     if DECISION_CONTEXT.get("players") and _needs_chat_history(user_message):
         return CLAUDE_DECISION_EFFORT

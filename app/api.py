@@ -105,9 +105,27 @@ class EngineHost:
             engine.DECISION_CONTEXT = prior_decision
 
 
+def _espn_context(engine):
+    context = engine.APP_CONTEXT or {}
+    league = context.get("league")
+    team = context.get("team")
+    if league is None or team is None:
+        raise HTTPException(status_code=503, detail="ESPN league data is not loaded.")
+    return league, team
+
+
+def _league_feature(operation):
+    try:
+        return operation()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"ESPN league feature unavailable ({type(exc).__name__}).") from None
+
+
 def create_app(engine_loader: Callable | None = None) -> FastAPI:
     host = EngineHost(engine_loader or (lambda: import_module("llm")))
-    api = FastAPI(title="Fantasy Coach API", version="7.9.0", docs_url="/docs")
+    api = FastAPI(title="Fantasy Coach API", version="7.12.0", docs_url="/docs")
     api.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -157,6 +175,62 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
                 raise HTTPException(status_code=422, detail=result.get("error", "Invalid position"))
             return result
 
+    # All league-intelligence reads are deterministic (no Claude calls).
+    # They share the existing engine lock so a concurrent refresh is safe.
+    @api.get("/api/league/standings")
+    def get_standings():
+        from league_intelligence import standings
+        with host.lock:
+            league, _ = _espn_context(host.ensure_ready())
+            return _league_feature(lambda: standings(league))
+
+    @api.get("/api/league/faab")
+    def get_faab():
+        from league_intelligence import faab
+        with host.lock:
+            league, _ = _espn_context(host.ensure_ready())
+            return _league_feature(lambda: faab(league))
+
+    @api.get("/api/league/schedule")
+    def get_schedule(team_id: int | None = Query(default=None, ge=1)):
+        from league_intelligence import schedule
+        with host.lock:
+            league, _ = _espn_context(host.ensure_ready())
+            return _league_feature(lambda: schedule(league, team_id))
+
+    @api.get("/api/league/matchups")
+    def get_matchups(week: int | None = Query(default=None, ge=1, le=18)):
+        from league_intelligence import matchups
+        with host.lock:
+            league, _ = _espn_context(host.ensure_ready())
+            return _league_feature(lambda: matchups(league, week))
+
+    @api.get("/api/league/teams/{team_id}/roster")
+    def get_team_roster(team_id: int, week: int | None = Query(default=None, ge=1, le=18)):
+        from league_intelligence import team_roster
+        with host.lock:
+            league, _ = _espn_context(host.ensure_ready())
+            return _league_feature(lambda: team_roster(league, team_id, week))
+
+    @api.get("/api/league/transactions")
+    def get_transactions(limit: int = Query(default=12, ge=1, le=25)):
+        from league_intelligence import transactions
+        with host.lock:
+            league, _ = _espn_context(host.ensure_ready())
+            return _league_feature(lambda: transactions(league, limit))
+
+    @api.get("/api/league/pending-claims")
+    def get_pending_claims():
+        from league_intelligence import pending_claims
+        return pending_claims()
+
+    @api.get("/api/strategy/week")
+    def get_week_strategy(week: int | None = Query(default=None, ge=1, le=18)):
+        from league_intelligence import matchup_strategy
+        with host.lock:
+            league, team = _espn_context(host.ensure_ready())
+            return _league_feature(lambda: matchup_strategy(league, team.team_id, week))
+
     @api.post("/api/chat")
     def chat(body: ChatRequest, x_fantasy_session: str | None = Header(default=None)):
         message = body.message.strip()
@@ -181,6 +255,8 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
                 engine.load_app_context()
             except Exception as exc:
                 raise HTTPException(status_code=503, detail=f"Refresh failed ({type(exc).__name__}).") from None
+            from league_intelligence import clear_cache
+            clear_cache()
             engine.EXTERNAL_PLAYER_CACHE.clear()
             engine.CHAT_HISTORY.clear()
             engine._reset_decision_context()
