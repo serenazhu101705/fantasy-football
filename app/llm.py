@@ -83,7 +83,7 @@ DECISION_CONTEXT = {
 MAX_HISTORY_MESSAGES = 2
 MAX_TOOL_ROUNDS = 4
 SEASON = 2026
-APP_VERSION = "v7.10"
+APP_VERSION = "v7.11"
 
 
 def _debug_enabled():
@@ -180,6 +180,10 @@ Core rules:
 - If current-status providers conflict, state the conflict; do not silently choose.
 - For waivers, NO_THRESHOLD_MOVE never means no players are available. Evaluate the
   returned candidate_pool directly, especially with an empty roster spot.
+- For standalone waiver-move questions, do NOT reuse earlier player matchups.
+  Only suggest adds drawn from the supplied actual waiver candidate_pool;
+  never suggest adding an existing player in roster_players. If no move is
+  justified, say HOLD rather than inventing a transaction or FAAB price.
 - When PREFETCHED APP EVIDENCE contains roster_context, you DO have current roster
   context. Never say you cannot see the roster; use its position counts, unavailable
   players, and focus-position players to judge roster need.
@@ -1345,7 +1349,19 @@ def tool_get_waiver_recommendations(position=None, limit=5):
     """
 
     transactions = APP_CONTEXT.get("waiver_transactions") or []
-    candidates = APP_CONTEXT.get("waiver_candidates") or []
+    # ESPN's loaded roster is the authoritative ownership source. Even if a
+    # stale precomputed waiver pool mistakenly includes a player on this team,
+    # never surface that player as an add (or count them as a free agent).
+    roster = APP_CONTEXT.get("roster") or []
+    owned_names = {normalize_name(p.get("name")) for p in roster}
+    owned_ids = {str(p.get("espn_id")) for p in roster if p.get("espn_id") is not None}
+    candidates = [
+        p for p in (APP_CONTEXT.get("waiver_candidates") or [])
+        if p.get("rostered") is not True
+        and normalize_name(p.get("name")) not in owned_names
+        and (p.get("espn_id") is None or str(p.get("espn_id")) not in owned_ids)
+    ]
+    eligible_names = {normalize_name(p.get("name")) for p in candidates}
 
     requested_position = _normalize_waiver_position(position)
     allowed_positions = {"QB", "RB", "WR", "TE", "K", "D/ST"}
@@ -1414,6 +1430,9 @@ def tool_get_waiver_recommendations(position=None, limit=5):
             continue
 
         add_player = transaction.get("add") or {}
+        # A stale transaction must not resurrect an owned or unavailable add.
+        if normalize_name(add_player.get("name")) not in eligible_names:
+            continue
         if requested_position is not None and add_player.get("position") != requested_position:
             continue
 
@@ -1749,6 +1768,21 @@ def _is_waiver_replacement_request(user_message):
     pool = bool(re.search(r"\b(waivers?|free agents?|available (?:rbs?|running backs?|players?)|waiver (?:rbs?|running backs?|players?)|pickup|pick up)\b", text))
     decision = bool(re.search(r"\b(drop|cut|replace|hold|keep|swap)\b", text))
     return pool and decision
+
+
+def _is_fresh_waiver_request(user_message, resolved_names):
+    """A standalone search of the waiver pool must not inherit a prior matchup.
+
+    Short contextual turns ("what about him on waivers?", "instead?") can still
+    follow a prior acquisition discussion. Explicitly naming a player also
+    preserves that player for targeted questions.
+    """
+    if resolved_names or _intent_for_message(user_message) != "waiver":
+        return False
+    text = normalize_name(user_message)
+    if re.search(r"\b(?:instead|that one|those|same|for him|for her|what about|how about)\b", text):
+        return False
+    return True
 
 
 def _waiver_drop_name(user_message, resolved_names):
@@ -2138,6 +2172,16 @@ def _derive_turn_context(user_message):
     context["players"] = list(previous_players)
 
     names = _extract_player_names(user_message, max_players=4)
+    if _is_fresh_waiver_request(user_message, names):
+        # Fresh standalone waiver searches override all stale comparison state.
+        # Merely setting explicit_intent='waiver' is insufficient: the generic
+        # acquisition-compare branch otherwise sees two carried-over names.
+        context.update({
+            "players": [], "horizon": None, "acquisition": True,
+            "position": None, "open_spot": False,
+            "requested_add_count": 1, "waiver_drop_target": None,
+        })
+        previous_players = []
     if len(names) >= 2:
         context["players"] = names
     elif len(names) == 1:
@@ -2557,10 +2601,22 @@ def _prefetch_evidence(user_message, turn_context=None):
                 "user_reports_open_spot": open_spot,
                 "waivers": compact_waiver,
                 "roster_context": _compact_roster_need(position),
+                "roster_players": [_non_none({
+                    "name": p.get("name"),
+                    "position": p.get("position"),
+                    "slot": p.get("lineup_slot"),
+                    "espn_projection": p.get("espn_projected_points"),
+                    "ros_score_advisory": p.get("ros_score"),
+                }) for p in (APP_CONTEXT.get("roster") or [])],
                 "instruction": (
-                    "Use roster_context when judging team need. If it is present, do not "
-                    "say the roster is unavailable. Choose the requested number of players "
-                    "from candidate_pool when the user asks for multiple adds."
+                    "This is a waiver-wire roster-improvement request, NOT an old "
+                    "start/sit or A-vs-B comparison. Use the currently loaded roster "
+                    "and the actual available candidate_pool to evaluate possible "
+                    "add/drop moves. NEVER suggest acquiring a player already in "
+                    "roster_players, and ONLY recommend adding a player in candidate_pool. "
+                    "If no candidate improves the roster, explicitly recommend HOLD. "
+                    "When the user asks for multiple adds, choose the requested number "
+                    "from candidate_pool. Do not invent waiver prices or availability."
                 ),
             }
 

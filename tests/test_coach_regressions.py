@@ -45,7 +45,7 @@ ROUTER_FUNCTIONS = [
     'normalize_name', 'json_text', '_non_none', '_debug_enabled', '_trace', '_evidence_sources',
     '_has_ros_cue', '_asks_league_scoring', '_is_roster_review',
     '_looks_like_waiver_acquisition', '_mentions_open_spot',
-    '_is_waiver_replacement_request', '_waiver_drop_name', '_intent_for_message',
+    '_is_waiver_replacement_request', '_is_fresh_waiver_request', '_waiver_drop_name', '_intent_for_message',
     '_extract_requested_position', '_extract_requested_add_count',
     '_all_resolvable_names', '_extract_player_names', '_reset_decision_context',
     '_explicit_horizon', '_merge_corrected_player', '_is_correction_turn',
@@ -380,6 +380,104 @@ class RouterRegressionTests(unittest.TestCase):
         self.assertEqual(stored[0]['claude_choice'], 'Tre Tucker')
         self.assertEqual(stored[0]['evaluation_scope'], 'weekly_head_to_head')
         self.assertEqual(stored[0]['usage']['input_tokens'], 2200)
+
+    def test_new_general_waiver_question_clears_previous_comparison(self):
+        # Regression: browser chat replied "A.J. Brown over Germie Bernard"
+        # to "any waiver moves for me to make".
+        brown = {'name': 'A.J. Brown', 'position': 'WR', 'rostered': True,
+                 'lineup_slot': 'WR', 'espn_projected_points': 15.95}
+        bernard = {'name': 'Germie Bernard', 'position': 'WR', 'rostered': True,
+                   'lineup_slot': 'BE', 'espn_projected_points': 13.41}
+        wilson = {'name': 'Emanuel Wilson', 'position': 'RB', 'rostered': False}
+        self.players.extend([brown, wilson])
+        self.names.update({p['name'].lower(): p for p in (brown, bernard, wilson)})
+        self.scope['APP_CONTEXT']['roster'] = [brown, bernard]
+        self.scope['APP_CONTEXT']['waiver_candidates'] = [wilson]
+        self.scope['tool_get_waiver_recommendations'] = lambda position=None, limit=5: {
+            'requested_position': 'ALL', 'matching_candidates_loaded': 1,
+            'candidate_pool': [{'name': 'Emanuel Wilson', 'position': 'RB'}],
+            'transaction_model_result': 'NO_THRESHOLD_MOVE', 'moves': [],
+        }
+        old = self.call('_derive_turn_context', 'a.j. brown or germie bernard')
+        self.call('_persist_turn_context', old)
+        # Mimic a previously inherited ROS/acquisition decision too.
+        self.scope['DECISION_CONTEXT'].update({'horizon': 'ros', 'position': 'WR',
+                                                'requested_add_count': 2, 'open_spot': True})
+        ctx = self.call('_derive_turn_context', 'any waiver moves for me to make')
+        self.assertEqual(ctx['effective_intent'], 'waiver')
+        self.assertEqual(ctx['players'], [])
+        self.assertIsNone(ctx['horizon'])
+        self.assertIsNone(ctx['position'])
+        self.assertEqual(ctx['requested_add_count'], 1)
+        self.assertFalse(ctx['open_spot'])
+        evidence = self.call('_prefetch_evidence', 'any waiver moves for me to make', ctx)
+        self.assertEqual(evidence['intent'], 'waiver')
+        self.assertEqual(evidence['waivers']['candidate_pool'][0]['name'], 'Emanuel Wilson')
+        self.assertEqual({p['name'] for p in evidence['roster_players']},
+                         {'A.J. Brown', 'Germie Bernard'})
+        self.assertIn('NEVER suggest acquiring', evidence['instruction'])
+        self.call('_persist_turn_context', ctx)
+        self.assertEqual(self.scope['DECISION_CONTEXT']['players'], [])
+        self.assertIsNone(self.scope['DECISION_CONTEXT']['horizon'])
+
+    def test_general_waiver_clears_previous_swap_drop_target(self):
+        lloyd = {'name': 'MarShawn Lloyd', 'position': 'RB', 'rostered': True}
+        self.players.append(lloyd)
+        self.names[lloyd['name'].lower()] = lloyd
+        prior = self.call('_derive_turn_context', 'drop marshawn lloyd for a waiver rb')
+        self.call('_persist_turn_context', prior)
+        ctx = self.call('_derive_turn_context', 'any waiver moves for me to make')
+        self.assertEqual(ctx['effective_intent'], 'waiver')
+        self.assertIsNone(ctx['waiver_drop_target'])
+        self.assertEqual(ctx['players'], [])
+        self.assertIsNone(ctx['position'])
+
+    def test_general_waiver_prefetch_one_mock_claude_call(self):
+        self.call('_persist_turn_context', self.call('_derive_turn_context', 'tucker or worthy'))
+        fake = types.SimpleNamespace(
+            stop_reason='end_turn',
+            usage=types.SimpleNamespace(input_tokens=400, output_tokens=110),
+            content=[types.SimpleNamespace(type='text', text='Hold for now.')],
+        )
+        calls = Mock(return_value=fake)
+        self.scope['create_claude_message'] = calls
+        with contextlib.redirect_stdout(io.StringIO()):
+            response = self.call('ask_claude', 'any waiver moves for me to make')
+        self.assertEqual(response, 'Hold for now.')
+        calls.assert_called_once()
+        self.assertEqual(calls.call_args.args[1], [])
+        prompt = calls.call_args.args[0][-1]['content']
+        self.assertIn('"intent":"waiver"', prompt)
+        self.assertNotIn('"player_a"', prompt)
+        self.assertNotIn('"players": [\n    "Tre Tucker"', prompt)
+
+    def test_stale_owned_and_rostered_players_excluded_from_waiver_tool(self):
+        # Test production tool function via AST without ESPN/network calls.
+        roster = [{'name': 'A.J. Brown', 'position': 'WR', 'espn_id': 1}]
+        pool = [
+            {'name': 'A.J. Brown', 'position': 'WR', 'espn_id': 1, 'rostered': False},
+            {'name': 'Other Team WR', 'position': 'WR', 'espn_id': 2, 'rostered': True},
+            {'name': 'Actual Free WR', 'position': 'WR', 'espn_id': 3, 'rostered': False},
+        ]
+        transactions = [
+            {'recommendation': 'ADD', 'add': pool[0], 'drop': roster[0]},
+            {'recommendation': 'ADD', 'add': pool[1], 'drop': roster[0]},
+            {'recommendation': 'ADD', 'add': pool[2], 'drop': roster[0]},
+        ]
+        scope = load_functions('llm.py', ['tool_get_waiver_recommendations'], {
+            'APP_CONTEXT': {'roster': roster, 'waiver_candidates': pool,
+                            'waiver_transactions': transactions},
+            'normalize_name': self.scope['normalize_name'],
+            '_normalize_waiver_position': lambda position: position,
+            '_waiver_candidate_sort_key': lambda p: (p.get('espn_id') or 0),
+            '_compact_waiver_candidate': lambda p, include_detail=True: {'name': p['name'], 'position': p['position']},
+            'compact_player': lambda p, **kwargs: {'name': p['name']},
+            '_non_none': lambda d: {k: v for k, v in d.items() if v is not None},
+        })
+        result = scope['tool_get_waiver_recommendations'](position='WR')
+        self.assertEqual([p['name'] for p in result['candidate_pool']], ['Actual Free WR'])
+        self.assertEqual([move['add']['name'] for move in result['moves']], ['Actual Free WR'])
+        self.assertEqual(result['matching_candidates_loaded'], 1)
 
     def test_trace_is_off_by_default(self):
         with unittest.mock.patch.dict(os.environ, {'FANTASY_DEBUG': '0'}):
