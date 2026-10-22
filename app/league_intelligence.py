@@ -6,6 +6,8 @@ ESPN projection is a point estimate, *not* a calibrated likelihood of winning.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+from collections import defaultdict
 from math import isfinite
 from threading import RLock
 from time import monotonic
@@ -13,6 +15,9 @@ from time import monotonic
 _CACHE_LOCK = RLock()
 _MATCHUP_CACHE: dict[tuple[int, int], tuple[float, list]] = {}
 _MATCHUP_TTL_SECONDS = 90
+_PROBABILITY_CACHE: dict[tuple[int, int], tuple[float, dict]] = {}
+_OPPONENT_CACHE: dict[tuple[int, int], tuple[float, dict]] = {}
+
 
 
 def _num(value):
@@ -54,7 +59,7 @@ def _get_box_scores(league, week):
     key = (id(league), week)
     with _CACHE_LOCK:
         item = _MATCHUP_CACHE.get(key)
-        if item and monotonic() - item[0] < _MATCHUP_TTL_SECONDS:
+        if item and monotonic() - item[0] < (30 if week == _week(league) else _MATCHUP_TTL_SECONDS):
             return item[1]
     # Do not silently cache a failed request as an empty scoreboard.
     scores = list(league.box_scores(week=week))
@@ -66,6 +71,8 @@ def _get_box_scores(league, week):
 def clear_cache():
     with _CACHE_LOCK:
         _MATCHUP_CACHE.clear()
+        _PROBABILITY_CACHE.clear()
+        _OPPONENT_CACHE.clear()
 
 
 def standings(league):
@@ -100,35 +107,141 @@ def faab(league):
 
 
 def schedule(league, team_id=None):
-    """ESPN-loaded season schedule; multiweek matchups may repeat."""
+    """One matchup per week, in chronological order, no reversed duplicates."""
     index = {_team_id(t): t for t in _teams(league)}
     if team_id is not None and team_id not in index:
         raise ValueError("Unknown team ID")
-    subjects = [index[team_id]] if team_id is not None else _teams(league)
     rows = []
-    seen_matchups = set()
-    for team in subjects:
+    seen = set()
+    for team in sorted(_teams(league), key=lambda x: _team_id(x) or 0):
+        tid = _team_id(team)
         opponents = getattr(team, "schedule", []) or []
         scores = getattr(team, "scores", []) or []
         outcomes = getattr(team, "outcomes", []) or []
         for ix, opponent in enumerate(opponents):
-            opp_id = _team_id(opponent)
-            is_bye = opp_id == _team_id(team) or opp_id is None
-            if team_id is None:
-                unique = (ix + 1, tuple(sorted((_team_id(team), opp_id))) if not is_bye else (_team_id(team),))
-                if unique in seen_matchups:
-                    continue
-                seen_matchups.add(unique)
+            oppid = _team_id(opponent)
+            is_bye = oppid is None or oppid == tid
+            if team_id is not None and tid != team_id and oppid != team_id:
+                continue
+            pair = (tid,) if is_bye else tuple(sorted((tid, oppid)))
+            key = (ix + 1, pair)
+            if key in seen:
+                continue
+            seen.add(key)
+            # Show the requested team in the first column for filtered schedules.
+            first = index[team_id] if team_id in (tid, oppid) else team
+            other_id = None if is_bye else (oppid if _team_id(first) == tid else tid)
+            second = index.get(other_id) if other_id is not None else None
+            first_scores = getattr(first, "scores", []) or []
+            second_scores = getattr(second, "scores", []) or [] if second is not None else []
+            first_outcomes = getattr(first, "outcomes", []) or []
             rows.append({
-                "week": ix + 1, "team_id": _team_id(team), "team": _team_name(team),
-                "opponent_id": None if is_bye else opp_id,
-                "opponent": None if is_bye else _team_name(index.get(opp_id, opponent)),
-                "score": _num(scores[ix]) if ix < len(scores) else None,
-                "result": outcomes[ix] if ix < len(outcomes) else None,
+                "week": ix + 1, "team_id": _team_id(first), "team": _team_name(first),
+                "opponent_id": other_id, "opponent": _team_name(second) if second else None,
+                "score": _num(first_scores[ix]) if ix < len(first_scores) else None,
+                "opponent_score": _num(second_scores[ix]) if ix < len(second_scores) else None,
+                "result": first_outcomes[ix] if ix < len(first_outcomes) else None,
                 "bye": is_bye,
             })
-    return {"schedule": rows}
+    rows.sort(key=lambda row: (row["week"], row["team_id"] or -1, row["opponent_id"] or -1))
+    return {"schedule": rows, "weeks": sorted({row["week"] for row in rows})}
 
+
+def nfl_opponents(league, week=None):
+    """ESPN professional schedule mapped by NFL abbreviation. No FantasyPros calls.
+
+    If the league adapter cannot retrieve the schedule, leave opponents unknown
+    rather than inventing a matchup or hiding bye weeks.
+    """
+    week = _week(league, week)
+    key = (id(league), week)
+    with _CACHE_LOCK:
+        cached = _OPPONENT_CACHE.get(key)
+        if cached and monotonic() - cached[0] < 600:
+            return cached[1]
+    from espn_api.football.constant import PRO_TEAM_MAP
+    pro_schedule = league._get_pro_schedule(week)
+    result = {}
+    for pro_id, value in pro_schedule.items():
+        opponent_id = value[0]
+        own = PRO_TEAM_MAP.get(pro_id)
+        opponent = PRO_TEAM_MAP.get(opponent_id)
+        if own and opponent:
+            result[str(own).upper()] = str(opponent).upper()
+    with _CACHE_LOCK:
+        _OPPONENT_CACHE[key] = (monotonic(), result)
+    return result
+
+
+def _probability_fraction(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if isfinite(number) and 0 <= number <= 1 else None
+
+
+def espn_win_probabilities(league, week=None):
+    """Read *ESPN's* fantasy winProbability, not NFL game-level odds.
+
+    The current espn-api BoxScore discards this raw response field; this one
+    authenticated, cached, read-only request uses its own ESPN request client.
+    """
+    week = _week(league, week)
+    if week > _week(league):
+        return {"status": "unavailable", "source": "ESPN Fantasy",
+                "note": "ESPN live win probability is not available for future weeks.", "teams": {}}
+    key = (id(league), week)
+    with _CACHE_LOCK:
+        cached = _PROBABILITY_CACHE.get(key)
+        if cached and monotonic() - cached[0] < (35 if week == _week(league) else _MATCHUP_TTL_SECONDS):
+            return cached[1]
+    result = {"status": "unavailable", "source": "ESPN Fantasy winProbability",
+              "note": "ESPN did not supply a verifiable fantasy matchup win probability.", "teams": {}}
+    try:
+        matchup_period = getattr(league, "currentMatchupPeriod", week)
+        periods = getattr(getattr(league, "settings", None), "matchup_periods", {}) or {}
+        for period, scoring_weeks in periods.items():
+            if week in scoring_weeks:
+                matchup_period = int(period)
+                break
+        filters = {"schedule": {"filterMatchupPeriodIds": {"value": [matchup_period]}}}
+        data = league.espn_request.league_get(
+            params={"view": ["mMatchupScore", "mScoreboard"], "scoringPeriodId": week},
+            headers={"x-fantasy-filter": json.dumps(filters)},
+        )
+        teams = {}
+        for matchup in data.get("schedule", []):
+            sides = []
+            for side in ("home", "away"):
+                item = matchup.get(side)
+                if not isinstance(item, dict):
+                    continue
+                tid, fraction = item.get("teamId"), _probability_fraction(item.get("winProbability"))
+                if tid is not None:
+                    sides.append((int(tid), fraction))
+            # Never create 0% from a missing field. Only mirror if exactly one
+            # side is known and there are exactly two opponents.
+            if len(sides) == 2:
+                (a, ap), (b, bp) = sides
+                if ap is None and bp is not None:
+                    ap = round(1 - bp, 6)
+                if bp is None and ap is not None:
+                    bp = round(1 - ap, 6)
+                if ap is not None and bp is not None:
+                    teams[a] = round(ap * 100, 2)
+                    teams[b] = round(bp * 100, 2)
+        if teams:
+            result = {"status": "available", "source": "ESPN Fantasy winProbability",
+                      "note": "ESPN's live estimated chances; not the NFL teams' win probabilities.",
+                      "teams": teams}
+    except Exception:
+        result["note"] = "ESPN win probability could not be retrieved. Projection margin remains available."
+    with _CACHE_LOCK:
+        _PROBABILITY_CACHE[key] = (monotonic(), result)
+    return result
 
 def _player_row(p):
     slot = getattr(p, "slot_position", None) or getattr(p, "lineupSlot", None)
@@ -139,6 +252,7 @@ def _player_row(p):
         "slot": slot, "starter": slot not in ("BE", "IR", "FA", None),
         "projected_points": _num(getattr(p, "projected_points", None)),
         "actual_points": _num(getattr(p, "points", None)),
+        "opponent": getattr(p, "pro_opponent", None) if getattr(p, "pro_opponent", None) not in (None, "None", "") else None,
         "injury_status": getattr(p, "injuryStatus", None),
         "on_bye": bool(getattr(p, "on_bye_week", False)),
         "game_played_pct": _num(getattr(p, "game_played", None)),
@@ -193,6 +307,10 @@ def team_roster(league, team_id, week=None):
                 break
         except Exception:
             projection_status = "unavailable"
+    try:
+        opponent_by_team = nfl_opponents(league, week)
+    except Exception:
+        opponent_by_team = {}
     return {"team_id": team_id, "name": _team_name(team), "week": week,
             "projection_status": projection_status,
             "roster": [{"espn_id": getattr(p, "playerId", None),
@@ -202,6 +320,9 @@ def team_roster(league, team_id, week=None):
                         "injury_status": getattr(p, "injuryStatus", None),
                         "weekly_slot": projected_by_id.get(getattr(p, "playerId", None), {}).get("slot"),
                         "projected_points": projected_by_id.get(getattr(p, "playerId", None), {}).get("projected_points"),
+                        "opponent": (projected_by_id.get(getattr(p, "playerId", None), {}).get("opponent")
+                                     or ("BYE" if str(getattr(p, "proTeam", "")).upper() not in opponent_by_team
+                                         and opponent_by_team else opponent_by_team.get(str(getattr(p, "proTeam", "")).upper()))),
                         "actual_points": projected_by_id.get(getattr(p, "playerId", None), {}).get("actual_points")}
                        for p in (getattr(team, "roster", None) or [])]}
 
@@ -284,11 +405,37 @@ def matchup_strategy(league, my_team_id, week=None):
     target = round(opp_proj + 0.01, 2) if opp_proj is not None else None
     gap = round(max(0, target - mine_proj), 2) if target is not None and mine_proj is not None else None
     upgrades = _lineup_upgrades(mine["roster"])
+    try:
+        opponent_by_team = nfl_opponents(league, current["week"])
+    except Exception:
+        opponent_by_team = {}
+    for side in (mine, other):
+        for player in side["roster"]:
+            if not player.get("opponent"):
+                team = str(player.get("nfl_team") or "").upper()
+                player["opponent"] = opponent_by_team.get(team)
+                if not player["opponent"] and team and opponent_by_team:
+                    player["opponent"] = "BYE"
+    from matchup_live import enrich_live_players, head_to_head, nfl_game_statuses
+    game_info = nfl_game_statuses(league, current["week"])
+    enrich_live_players(mine, other, game_info)
+    paired_starters = head_to_head(mine, other)
+    probabilities = espn_win_probabilities(league, current["week"])
+    my_probability = probabilities["teams"].get(my_team_id)
+    opponent_probability = probabilities["teams"].get(other["team_id"])
     return {
         "week": current["week"], "status": "available", "as_of": current["as_of"],
+        "head_to_head": paired_starters,
+        "live_status": game_info["status"], "live_source": game_info["source"],
+        "live_as_of": game_info["as_of"], "live_note": game_info["note"],
         "projection_source": "ESPN weekly box-score projected final totals",
         "my_team": mine, "opponent": other,
         "projected_margin": delta,
+        "espn_win_probability_pct": my_probability,
+        "espn_opponent_win_probability_pct": opponent_probability,
+        "win_probability_status": "available" if my_probability is not None else "unavailable",
+        "win_probability_source": probabilities["source"],
+        "win_probability_note": probabilities["note"],
         "projected_favorite": "me" if delta is not None and delta > 0 else
                               "opponent" if delta is not None and delta < 0 else
                               "tied" if delta == 0 else "unknown",

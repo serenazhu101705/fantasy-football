@@ -125,7 +125,7 @@ def _league_feature(operation):
 
 def create_app(engine_loader: Callable | None = None) -> FastAPI:
     host = EngineHost(engine_loader or (lambda: import_module("llm")))
-    api = FastAPI(title="Fantasy Coach API", version="7.12.0", docs_url="/docs")
+    api = FastAPI(title="Fantasy Coach API", version="7.14.0", docs_url="/docs")
     api.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -155,17 +155,45 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             data = engine.tool_get_roster()
             return {"name": data.get("league"), "week": data.get("week"),
                     "scoring": data.get("league_settings"),
-                    "roster_size": len(data.get("players") or []), "version": engine.APP_VERSION}
+                    "roster_size": len(data.get("players") or []),
+                    "my_team_id": getattr((engine.APP_CONTEXT or {}).get("team"), "team_id", None),
+                    "version": engine.APP_VERSION}
 
     @api.get("/api/roster")
     def roster():
+        from league_intelligence import nfl_opponents
         with host.lock:
-            return host.ensure_ready().tool_get_roster()
+            engine = host.ensure_ready()
+            data = engine.tool_get_roster()
+            league = (engine.APP_CONTEXT or {}).get("league")
+            try:
+                opponents = nfl_opponents(league) if league is not None else {}
+            except Exception:
+                opponents = {}
+            for player in data.get("players", []):
+                if player.get("on_bye_week"):
+                    player["opponent"] = "BYE"
+                elif not player.get("opponent"):
+                    player["opponent"] = opponents.get(str(player.get("team") or "").upper())
+            return data
 
     @api.get("/api/lineup")
     def lineup():
+        from league_intelligence import nfl_opponents
         with host.lock:
-            return host.ensure_ready().tool_get_optimal_lineup()
+            engine = host.ensure_ready()
+            data = engine.tool_get_optimal_lineup()
+            league = (engine.APP_CONTEXT or {}).get("league")
+            try:
+                opponents = nfl_opponents(league) if league is not None else {}
+            except Exception:
+                opponents = {}
+            for player in (data.get("lineup") or {}).values():
+                if isinstance(player, dict) and not player.get("opponent"):
+                    player["opponent"] = "BYE" if player.get("on_bye_week") else opponents.get(str(player.get("team") or "").upper())
+            from lineup_explanations import explain_lineup
+            data["explanation"] = explain_lineup(data, engine.tool_get_roster().get("players") or [])
+            return data
 
     @api.get("/api/waivers")
     def waivers(position: str | None = Query(default=None), limit: int = Query(default=5, ge=1, le=12)):
@@ -219,6 +247,21 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             league, _ = _espn_context(host.ensure_ready())
             return _league_feature(lambda: transactions(league, limit))
 
+    @api.get("/api/news")
+    def get_news(limit: int = Query(default=24, ge=1, le=50)):
+        # Independent of ESPN/Claude and engine lock. Cached RSS providers.
+        from news_feed import news_feed
+        return news_feed(limit=limit)
+
+    @api.get("/api/news/roster")
+    def get_roster_news():
+        # Only requested by the "My Team News" tab: no background fan-out on load.
+        from news_feed import roster_news
+        with host.lock:
+            players = deepcopy(host.ensure_ready().tool_get_roster().get("players") or [])
+        # Network/RSS fan-out must not hold the Claude/ESPN conversation lock.
+        return roster_news(players)
+
     @api.get("/api/league/pending-claims")
     def get_pending_claims():
         from league_intelligence import pending_claims
@@ -230,6 +273,36 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         with host.lock:
             league, team = _espn_context(host.ensure_ready())
             return _league_feature(lambda: matchup_strategy(league, team.team_id, week))
+
+    @api.get("/api/players/{player_id}")
+    def get_player_profile(player_id: int, week: int | None = Query(default=None, ge=1, le=18)):
+        """Read-only ESPN profile; clicking a name never invokes Claude."""
+        from matchup_live import player_profile
+        with host.lock:
+            league, _ = _espn_context(host.ensure_ready())
+            try:
+                return player_profile(league, player_id, week)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail=f"Player profile unavailable ({type(exc).__name__}).") from None
+
+    @api.post("/api/players/{player_id}/analysis")
+    def generate_player_analysis(player_id: int, week: int | None = Query(default=None, ge=1, le=18)):
+        """The *only* player-detail endpoint that spends Claude tokens."""
+        from matchup_live import player_profile
+        from player_analysis import summarize_player
+        with host.lock:
+            engine = host.ensure_ready()
+            league, _ = _espn_context(engine)
+            try:
+                profile = player_profile(league, player_id, week)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+            try:
+                return summarize_player(profile, engine.client, engine.MODEL)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Claude player analysis unavailable ({type(exc).__name__}).") from None
 
     @api.post("/api/chat")
     def chat(body: ChatRequest, x_fantasy_session: str | None = Header(default=None)):
@@ -256,7 +329,11 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(status_code=503, detail=f"Refresh failed ({type(exc).__name__}).") from None
             from league_intelligence import clear_cache
+            from matchup_live import clear_live_cache
+            from player_analysis import clear_analysis_cache
             clear_cache()
+            clear_live_cache()
+            clear_analysis_cache()
             engine.EXTERNAL_PLAYER_CACHE.clear()
             engine.CHAT_HISTORY.clear()
             engine._reset_decision_context()
