@@ -12,6 +12,15 @@ from threading import RLock
 import json
 import os
 
+
+class RecapEmptyResponseError(RuntimeError):
+    """Provider returned no user-visible recap; no result should be cached."""
+
+    def __init__(self, stop_reason: str, block_types: list[str]):
+        self.stop_reason = stop_reason
+        self.block_types = block_types
+        super().__init__(f"Claude returned no visible weekly recap (stop_reason={stop_reason}).")
+
 _LOCK = RLock()
 _DIR = Path.home() / ".cache" / "fantasy_coach" / "weekly_recaps"
 
@@ -102,11 +111,33 @@ def generate_weekly_recap(league, team_id, client, model, week=None, *, status_f
             "If a player score is missing don't treat it as zero.\nESPN final matchup facts: "
             + json.dumps(facts, separators=(",", ":"))
         )
-        response = client.messages.create(model=model, max_tokens=650,
-                                          messages=[{"role": "user", "content": prompt}])
-        narrative = "".join(getattr(b, "text", "") for b in response.content if getattr(b, "type", "") == "text").strip()
+        # Sonnet 5.5 otherwise defaults to adaptive thinking. A small response
+        # budget can be consumed by hidden thinking without any recap text.
+        # This is a straightforward summary of supplied facts, so request no
+        # up-front thinking and allow sufficient room for a 200-300 word reply.
+        # Never retry automatically: every Claude attempt can incur charges.
+        kwargs = {
+            "model": model,
+            "max_tokens": 1400,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if str(model).startswith("claude-sonnet-5-5"):
+            kwargs["thinking"] = {"type": "between_tools"}
+            kwargs["output_config"] = {"effort": "low"}
+        response = client.messages.create(**kwargs)
+        blocks = getattr(response, "content", []) or []
+        narrative = "".join(
+            str(getattr(block, "text", "") or "")
+            for block in blocks if getattr(block, "type", "") == "text"
+        ).strip()
         if not narrative:
-            raise ValueError("Claude returned an empty weekly recap")
+            stop_reason = str(getattr(response, "stop_reason", "unknown"))
+            block_types = [str(getattr(block, "type", "unknown")) for block in blocks]
+            if os.getenv("FANTASY_DEBUG") == "1":
+                print(f"[WEEKLY RECAP] empty_response stop_reason={stop_reason} "
+                      f"content_types={block_types} model={model} "
+                      f"output_tokens={getattr(getattr(response, 'usage', None), 'output_tokens', 'n/a')}")
+            raise RecapEmptyResponseError(stop_reason, block_types)
         result = {"season": season, "week": week, "analysis": narrative,
                   "source": "Claude analysis of finalized ESPN fantasy matchup",
                   "generated_at": datetime.now(timezone.utc).isoformat(),

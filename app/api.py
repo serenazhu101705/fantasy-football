@@ -397,13 +397,21 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
     @api.post("/api/recaps/week")
     def post_weekly_recap(week: int | None = Query(default=None, ge=1, le=18)):
         """Opt-in paid Claude recap; never call until all NFL games are final."""
-        from weekly_recap import generate_weekly_recap
+        from weekly_recap import generate_weekly_recap, RecapEmptyResponseError
         with host.lock:
             engine = host.ensure_ready()
             league, team = _espn_context(engine)
             client, model = engine.client, engine.MODEL
         try:
             return generate_weekly_recap(league, team.team_id, client, model, week)
+        except RecapEmptyResponseError as exc:
+            # A completed NFL week is not a conflict; it is a failed model
+            # response. Surface only a safe stop reason, never prompt or keys.
+            raise HTTPException(
+                status_code=502,
+                detail=f"Claude returned no visible weekly recap (stop_reason={exc.stop_reason}). "
+                       "No recap was cached. See [WEEKLY RECAP] in backend logs."
+            ) from None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except Exception as exc:
