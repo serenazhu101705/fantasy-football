@@ -146,3 +146,15 @@
 .email-option input{accent-color:#b8f875;width:17px;height:17px;flex-shrink:0}
 .email-settings .button-action{justify-self:start}.email-settings .detail-error,.email-settings .automation-success{margin:0}
 @media(max-width:700px){.email-settings{padding:15px}.apply-preview{margin:10px}}
+
+/* v7.24: ESPN player portraits with accessible initial fallback. */
+.player-headshot{display:grid;place-items:end center;flex-shrink:0;overflow:hidden;border:1px solid #344a4b;background:radial-gradient(circle at 50% 13%,#40574a,#20322e 68%);color:#cef89d;isolation:isolate}
+.player-headshot-sm{width:38px;height:38px;border-radius:10px}
+.player-headshot-lg{width:92px;height:92px;border-radius:16px;background:radial-gradient(circle at 50% 19%,#526c4c,#263f32 70%)}
+.player-headshot img{display:block;width:100%;height:100%;object-fit:contain;object-position:center bottom}
+.player-headshot-fallback{align-self:center;justify-self:center;font-family:'Space Grotesk',sans-serif;font-weight:800;font-size:13px;letter-spacing:.4px}
+.player-headshot-lg .player-headshot-fallback{font-size:26px}
+.drawer-player-identity{display:flex;align-items:center;gap:16px;min-width:0}
+.drawer-player-label{min-width:0}
+.drawer-player-label h2{overflow-wrap:anywhere}
+@media(max-width:450px){.player-row{gap:7px}.player-headshot-sm{width:33px;height:33px}.drawer-player-identity{gap:10px}.player-headshot-lg{width:66px;height:66px}.drawer-header h2{font-size:20px}}

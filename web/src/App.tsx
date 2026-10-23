@@ -3,6 +3,7 @@ import type { FormEvent, ReactNode } from 'react'
 import { Activity, ArrowRight, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, ClipboardList, Clock3, LayoutDashboard, MessageCircle, Newspaper, RefreshCw, Send, X, ShieldCheck, Sparkles, TrendingUp, Trophy, Users, Zap, Mail, Settings2 } from 'lucide-react'
 import { ApiError, post, request } from './api'
 import { orderRoster } from './rosterLayout'
+import { PlayerHeadshot } from './PlayerHeadshot'
 import type { CoachReply, LeagueData, LineupData, Player, WaiverBrowserData, MatchupStrategy,
   LineupPreview, ApplyLineupResponse, StandingsData, FaabData, ScheduleData, TransactionData, TeamRosterData, ClaimsData, LeagueMatchupsData, NewsBrowseData, RosterNewsData, MatchupPlayer, PlayerProfile, PlayerAnalysis, StatLine, WeeklyRecap, WeeklyRecapStatus } from './api' 
 
@@ -31,6 +32,7 @@ function PlayerRow({ player, showSlot = false, onOpen }: { player: Player, showS
   const status = player.on_bye_week ? 'BYE' : player.injury_status
   return <div className="player-row">
     <div className={`position pos-${(player.position || '').replace('/', '')}`}>{showSlot && player.lineup_slot ? player.lineup_slot : player.position || '?'}</div>
+    <PlayerHeadshot id={player.espn_id} name={player.name}/>
     <div className="player-title"><button type="button" className="player-link player-name" disabled={!onOpen || player.espn_id == null} title={player.espn_id == null?'ESPN player ID unavailable':'Open player profile'} onClick={()=>{if(onOpen && player.espn_id != null)onOpen(player.espn_id,player.name)}}>{player.name}</button><span className="subtext">{player.team || 'NFL'}{player.opponent ? ` · vs ${player.opponent}` : ''}</span></div>
     {status && status !== 'ACTIVE' && <span className="injury">{status}</span>}
     <div className="projection"><strong>{points(player.lineup_projection ?? player.espn_projection ?? player.fantasypros_projection)}</strong><span className="subtext">{player.lineup_projection_sources && player.lineup_projection_sources.length > 1 ? 'avg proj.' : 'proj.'}</span></div>
@@ -127,7 +129,7 @@ function PlayerDrawer({ selected, onClose, week }: {selected:{id:number,name:str
   }
   return <div className="drawer-scrim" onMouseDown={onClose} role="presentation">
     <section className="player-drawer" role="dialog" aria-modal="true" aria-label={`${selected.name} player details`} onMouseDown={e=>e.stopPropagation()}>
-      <div className="drawer-header"><div><span className="panel-kicker">ESPN PLAYER INTELLIGENCE</span><h2>{profile?.name || selected.name}</h2><p>{profile ? `${profile.position || ''} · ${profile.nfl_team || 'Unknown team'} · ${profile.injury_status || 'Status unavailable'}` : 'Loading player data…'}</p></div><button className="drawer-close" onClick={onClose} aria-label="Close player details"><X size={19}/></button></div>
+      <div className="drawer-header"><div className="drawer-player-identity"><PlayerHeadshot id={selected.id} name={profile?.name || selected.name} size="lg"/><div className="drawer-player-label"><span className="panel-kicker">ESPN PLAYER INTELLIGENCE</span><h2>{profile?.name || selected.name}</h2><p>{profile ? `${profile.position || ''} · ${profile.nfl_team || 'Unknown team'} · ${profile.injury_status || 'Status unavailable'}` : 'Loading player data…'}</p></div></div><button className="drawer-close" onClick={onClose} aria-label="Close player details"><X size={19}/></button></div>
       {error && <div className="detail-error">{error}</div>}
       {profile && <div className="drawer-body">
         <div className="detail-metrics"><div><span>SEASON POINTS</span><strong>{points(profile.season_fantasy_points)}</strong></div><div><span>FANTASY PPG</span><strong>{points(profile.season_fantasy_ppg)}</strong></div><div><span>WEEK {profile.week} PROJECTION</span><strong>{points(profile.current_week.projected_points)}</strong></div><div><span>WEEK {profile.week} ACTUAL</span><strong>{points(profile.current_week.fantasy_points)}</strong></div></div>
