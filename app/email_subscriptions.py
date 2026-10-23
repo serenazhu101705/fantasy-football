@@ -1,4 +1,4 @@
-"""Explicit opt-in fantasy email digests (SQLite + SMTP, no cloud dependency).
+"""Explicit opt-in fantasy email digests (SQLite + HTTPS Resend or SMTP).
 
 Subscriptions require confirmation by email. Scheduled delivery is driven by
 run_digest_jobs.py / an external cron job; starting Uvicorn doesn't schedule jobs.
@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from email.message import EmailMessage
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -18,6 +19,8 @@ import smtplib
 from dotenv import load_dotenv
 import sqlite3
 from urllib.parse import quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 load_dotenv()
 
@@ -66,10 +69,49 @@ def _valid_email(email):
     return email
 
 
+def _send_resend_https(to, subject, body):
+    """Send an email over HTTPS (Railway Free blocks outbound SMTP).
+
+    Raises a safe error that does not echo the API key or raw provider response.
+    Calls the Resend transactional email API once; no automatic paid retries.
+    """
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    sender = os.getenv("RESEND_FROM_EMAIL", "").strip() or os.getenv("SMTP_FROM", "").strip()
+    if not api_key or not sender:
+        raise RuntimeError("Configure RESEND_API_KEY and RESEND_FROM_EMAIL to send through Resend HTTPS.")
+    payload = json.dumps({"from": sender, "to": [to], "subject": subject, "text": body}).encode("utf-8")
+    request = Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            status = response.status
+            body_bytes = response.read(16384)
+    except HTTPError as exc:
+        # Don't return raw provider errors; they can contain recipient details.
+        raise RuntimeError(f"Resend HTTPS email rejected (HTTP {exc.code}). Verify your sending domain and recipient permissions.") from None
+    except (URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Resend HTTPS email transport failed ({type(exc).__name__}).") from None
+    if status not in (200, 201, 202):
+        raise RuntimeError(f"Resend HTTPS email returned unexpected status {status}.")
+    try:
+        record = json.loads(body_bytes)
+    except (ValueError, UnicodeDecodeError):
+        raise RuntimeError("Resend HTTPS email returned an unreadable response.") from None
+    if not isinstance(record, dict) or not record.get("id"):
+        raise RuntimeError("Resend HTTPS email did not confirm acceptance.")
+    return record["id"]
+
+
 def send_email(to, subject, body, *, transport=None):
-    """SMTP settings are server-only. Never log credentials."""
+    """Email sending is server-only. Prefer HTTPS Resend on cloud deployments."""
     if transport:
         return transport(to, subject, body)
+    if os.getenv("FANTASY_EMAIL_TRANSPORT", "").strip().lower() == "resend" or os.getenv("RESEND_API_KEY"):
+        return _send_resend_https(to, subject, body)
     host = os.getenv("SMTP_HOST")
     sender = os.getenv("SMTP_FROM")
     if not host or not sender:
@@ -177,12 +219,22 @@ def send_digest(subscriber, kind, event_key, subject, content, *, transport=None
         return False
     # Each email includes its own one-time random unsubscribe token, stored as
     # a hash. Old unsubscribe links remain valid after later digest messages.
-    token = secrets.token_urlsafe(30)
-    base = os.getenv("FANTASY_PUBLIC_API_URL", "http://127.0.0.1:8000").rstrip("/")
-    footer = f"\n\nUnsubscribe: {base}/api/subscriptions/unsubscribe?token={quote(token)}\n"
-    send_email(subscriber["email"], subject, content + footer, transport=transport)
-    with _db() as db:
-        db.execute("INSERT OR IGNORE INTO unsubscribe_tokens(token_hash,email) VALUES(?,?)",
-                   (_token_hash(token),subscriber["email"]))
+    if os.getenv("FANTASY_PERSONAL_EMAIL_MODE") == "1":
+        # The personal GitHub runner has no public HTTP server, so it must not
+        # embed a localhost unsubscribe URL that cannot work when the Mac is off.
+        repo = os.getenv("GITHUB_REPOSITORY", "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            raise RuntimeError("Personal email mode requires GITHUB_REPOSITORY.")
+        footer = ("\n\nTo stop these personal notifications, disable the "
+                  f"Fantasy Coach Emails workflow in https://github.com/{repo}/actions.\n")
+        send_email(subscriber["email"], subject, content + footer, transport=transport)
+    else:
+        token = secrets.token_urlsafe(30)
+        base = os.getenv("FANTASY_PUBLIC_API_URL", "http://127.0.0.1:8000").rstrip("/")
+        footer = f"\n\nUnsubscribe: {base}/api/subscriptions/unsubscribe?token={quote(token)}\n"
+        send_email(subscriber["email"], subject, content + footer, transport=transport)
+        with _db() as db:
+            db.execute("INSERT OR IGNORE INTO unsubscribe_tokens(token_hash,email) VALUES(?,?)",
+                       (_token_hash(token),subscriber["email"]))
     mark_sent(subscriber["email"],kind,event_key)
     return True

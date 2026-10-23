@@ -26,6 +26,8 @@ from league_settings import get_league_scoring_context, reception_points_or_defa
 from recommendation_journal import choice_instruction, extract_choice, create_record, save_record
 from league_intelligence import (matchup_strategy, standings as league_standings,
     faab as league_faab, schedule as league_schedule, team_roster as league_team_roster)
+from nfl_leaderboards import (parse_leaderboard_request, get_nfl_leaderboard,
+    format_leaderboard_answer)
 
 
 # ==================================================
@@ -85,7 +87,7 @@ DECISION_CONTEXT = {
 MAX_HISTORY_MESSAGES = 2
 MAX_TOOL_ROUNDS = 4
 SEASON = 2026
-APP_VERSION = "v7.15"
+APP_VERSION = "v7.23"
 
 
 def _debug_enabled():
@@ -1701,7 +1703,8 @@ def select_tools_for_message(user_message):
         wanted = set(names)
         return [tool for tool in TOOLS if tool["name"] in wanted]
 
-    if _is_matchup_strategy_query(user_message) or _is_league_data_query(user_message):
+    if (_is_matchup_strategy_query(user_message) or _is_league_data_query(user_message)
+            or _is_nfl_leaderboard_query(user_message)):
         return []
     if _asks_league_scoring(user_message):
         return pick("get_system_status")
@@ -1837,8 +1840,14 @@ def _is_league_data_query(user_message):
     ))
 
 
+def _is_nfl_leaderboard_query(user_message):
+    return parse_leaderboard_request(user_message) is not None
+
+
 def _intent_for_message(user_message):
     text = normalize_name(user_message)
+    if _is_nfl_leaderboard_query(user_message):
+        return "nfl_leaderboard"
     if _is_matchup_strategy_query(user_message):
         return "matchup_strategy"
     if _is_league_data_query(user_message):
@@ -2263,7 +2272,7 @@ def _derive_turn_context(user_message):
         context["acquisition"] = True
 
     explicit_intent = _intent_for_message(user_message)
-    if explicit_intent in {"matchup_strategy", "league_data"}:
+    if explicit_intent in {"matchup_strategy", "league_data", "nfl_leaderboard"}:
         context["horizon"] = None
         context["acquisition"] = False
         context["position"] = None
@@ -2291,7 +2300,7 @@ def _derive_turn_context(user_message):
             explicit_intent == "weekly"
             and re.search(r"\b(?:who should i start|who do i start|start sit|my starters)\b", normalize_name(user_message))
         )
-        if new_comparison or new_pool_request or new_weekly_question or explicit_intent in {"roster_review", "lineup", "league_info", "matchup_strategy", "league_data"}:
+        if new_comparison or new_pool_request or new_weekly_question or explicit_intent in {"roster_review", "lineup", "league_info", "matchup_strategy", "league_data", "nfl_leaderboard"}:
             drop_target = None
 
     if drop_target:
@@ -2506,6 +2515,10 @@ def _prefetch_evidence(user_message, turn_context=None):
     intent = turn_context.get("effective_intent") or _intent_for_message(user_message)
 
     try:
+        if intent == "nfl_leaderboard":
+            data = get_nfl_leaderboard(user_message, season=SEASON)
+            return {"intent": "nfl_leaderboard", "leaderboard": data}
+
         if intent == "matchup_strategy":
             context = APP_CONTEXT or {}
             league, team = context.get("league"), context.get("team")
@@ -2947,6 +2960,24 @@ def ask_claude(user_message, *, return_details=False):
     prefetched = _prefetch_evidence(user_message, turn_context=turn_context)
     if prefetched is not None:
         prefetched["league_context"] = _compact_league_context()
+
+    # Numeric NFL leaderboards are factual lookups, not fantasy decisions.
+    # Answer them directly so the simple query costs ZERO Claude calls.
+    if prefetched is not None and prefetched.get("intent") == "nfl_leaderboard":
+        result = prefetched.get("leaderboard") or {}
+        response_text = format_leaderboard_answer(result)
+        print("\nCoach: " + response_text)
+        _trace("NFL_LEADERBOARD", status=result.get("status"),
+               metric=result.get("stat"), source=result.get("source"),
+               through_week=result.get("through_week"), api_calls=0)
+        CHAT_HISTORY.append({"role": "user", "content": user_message})
+        CHAT_HISTORY.append({"role": "assistant", "content": response_text})
+        _persist_turn_context(turn_context)
+        if return_details:
+            return {"answer": response_text, "api_calls": 0,
+                    "input_tokens": 0, "output_tokens": 0,
+                    "prefetched": True, "intent": "nfl_leaderboard"}
+        return response_text
 
     # If deterministic prefetch already resolved the players/horizon, old prose history
     # is redundant and expensive. Keep history only when Claude truly needs it to infer

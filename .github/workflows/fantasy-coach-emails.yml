@@ -1,0 +1,72 @@
+name: Fantasy Coach Emails
+
+on:
+  schedule:
+    # Around 6 AM and throughout the day, Eastern time. GitHub can delay jobs.
+    # The Python scheduler determines whether a given email is actually due.
+    - cron: '17 6,9,13,17,21 * * *'
+      timezone: 'America/New_York'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: fantasy-coach-personal-email
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      FANTASY_PERSONAL_EMAIL_MODE: '1'
+      FANTASY_REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+      FANTASY_SUBSCRIPTIONS_DB: data/fantasy_subscriptions.sqlite3
+      FANTASY_OWNER_EMAIL: ${{ secrets.FANTASY_OWNER_EMAIL }}
+      ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
+      ESPN_TEAM_ID: ${{ secrets.ESPN_TEAM_ID }}
+      ESPN_S2: ${{ secrets.ESPN_S2 }}
+      ESPN_SWID: ${{ secrets.ESPN_SWID }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_MODEL: claude-sonnet-5-5
+      FANTASY_EMAIL_TRANSPORT: resend
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      RESEND_FROM_EMAIL: 'Fantasy Coach <onboarding@resend.dev>'
+      ESPN_WRITES_ENABLED: '0'
+      ESPN_AUTO_SWAPS_ENABLED: '0'
+      FANTASY_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Restore provider data cache
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: fantasy-source-cache-${{ github.run_id }}
+          restore-keys: fantasy-source-cache-
+      - name: Restore last-run email delivery state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/restore_email_state.py
+      - name: Initialize self-only subscriber if needed
+        run: uv run --frozen python app/github_email_bootstrap.py
+      - name: Send due digest emails
+        env:
+          HOME: ${{ github.workspace }}/data/cloud_home
+        run: uv run --frozen python app/run_digest_jobs.py
+      - name: Save email delivery state for next run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fantasy-coach-email-state
+          path: |
+            data/fantasy_subscriptions.sqlite3
+            data/cloud_home/.cache/fantasy_coach/weekly_recaps/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30

@@ -22,6 +22,7 @@ from unittest.mock import Mock
 
 APP_DIR = Path(__file__).resolve().parents[1] / 'app'
 sys.path.insert(0, str(APP_DIR))
+from nfl_leaderboards import parse_leaderboard_request, format_leaderboard_answer
 
 
 def load_functions(filename, names, injected=None):
@@ -44,7 +45,7 @@ def load_functions(filename, names, injected=None):
 ROUTER_FUNCTIONS = [
     'normalize_name', 'json_text', '_non_none', '_debug_enabled', '_trace', '_evidence_sources',
     '_has_ros_cue', '_asks_league_scoring', '_is_roster_review',
-    '_is_matchup_strategy_query', '_is_league_data_query',
+    '_is_matchup_strategy_query', '_is_league_data_query', '_is_nfl_leaderboard_query',
     '_looks_like_waiver_acquisition', '_mentions_open_spot',
     '_is_waiver_replacement_request', '_is_fresh_waiver_request', '_waiver_drop_name', '_intent_for_message',
     '_extract_requested_position', '_extract_requested_add_count',
@@ -109,10 +110,28 @@ class RouterRegressionTests(unittest.TestCase):
             'create_record': lambda **kwargs: {'evaluation_scope': 'not_weekly_scored'},
             'save_record': lambda record: None,
             'SEASON': 2026,
+            'parse_leaderboard_request': parse_leaderboard_request,
+            'get_nfl_leaderboard': lambda question, season=2026: {'status': 'available', 'season': season, 'stat': 'passing_yards', 'stat_label': 'Passing yards', 'unit': 'yds', 'through_week': 7, 'leaders': [{'rank': 1, 'name': 'Sample QB', 'team': 'CIN', 'value': 1750.0}]},
+            'format_leaderboard_answer': format_leaderboard_answer,
         })
 
     def call(self, name, *args, **kwargs):
         return self.scope[name](*args, **kwargs)
+
+    def test_nfl_leaderboard_resets_old_player_comparison(self):
+        self.scope['DECISION_CONTEXT']['players'] = ['Tre Tucker', 'Xavier Worthy']
+        ctx = self.call('_derive_turn_context', 'who leads the league in passing yard')
+        self.assertEqual(ctx['effective_intent'], 'nfl_leaderboard')
+        self.assertEqual(ctx['players'], [])
+        prefetched = self.call('_prefetch_evidence', 'who leads the league in passing yard', ctx)
+        self.assertEqual(prefetched['leaderboard']['leaders'][0]['name'], 'Sample QB')
+
+    def test_nfl_leaderboard_answer_makes_zero_paid_claude_calls(self):
+        self.scope['create_claude_message'] = lambda *args, **kwargs: self.fail('Do not call Claude for verified leaderboards')
+        result = self.call('ask_claude', 'who leads the league in passing yard', return_details=True)
+        self.assertEqual(result['api_calls'], 0)
+        self.assertIn('Sample QB', result['answer'])
+        self.assertEqual(result['intent'], 'nfl_leaderboard')
 
     def test_matchup_strategy_clears_prior_comparison(self):
         self.call('_derive_turn_context', 'tucker or worthy')

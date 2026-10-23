@@ -310,6 +310,16 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             league, _ = _espn_context(host.ensure_ready())
             return _league_feature(lambda: transactions(league, limit))
 
+    @api.get("/api/nfl/leaders")
+    def get_nfl_leaders(stat: str = Query(default="passing_yards"),
+                        limit: int = Query(default=10, ge=1, le=20)):
+        """Read-only NFL leaders; no Claude/FantasyPros requests."""
+        from nfl_leaderboards import METRICS, get_nfl_leaderboard
+        if stat not in METRICS:
+            raise HTTPException(status_code=422, detail="Unsupported NFL statistic.")
+        result = get_nfl_leaderboard(f"top {limit} NFL {stat.replace('_', ' ')}", season=2026)
+        return result
+
     @api.get("/api/news")
     def get_news(limit: int = Query(default=24, ge=1, le=50)):
         # Independent of ESPN/Claude and engine lock. Cached RSS providers.
@@ -338,7 +348,17 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         with host.lock:
             players = deepcopy(host.ensure_ready().tool_get_roster().get("players") or [])
         # Network/RSS fan-out must not hold the Claude/ESPN conversation lock.
-        return roster_news(players, refresh=refresh)
+        # Old news_feed.py releases didn't support the refresh kwarg. Give a
+        # precise compatibility error rather than a generic 500 traceback.
+        try:
+            return roster_news(players, refresh=refresh)
+        except TypeError as exc:
+            if "unexpected keyword argument 'refresh'" in str(exc):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Outdated app/news_feed.py: install the matching news module and restart FastAPI.",
+                ) from None
+            raise
 
     @api.get("/api/league/pending-claims")
     def get_pending_claims():

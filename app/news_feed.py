@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from threading import RLock
 from time import monotonic
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlencode, urlunparse
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 import json
@@ -26,7 +26,7 @@ _LOCK = RLock()
 _CACHE = None
 _PLAYER_CACHE: dict[tuple, tuple[float, list]] = {}
 _CACHE_SECONDS = 15 * 60
-_PLAYER_SECONDS = 60 * 60
+_PLAYER_SECONDS = 15 * 60  # News can change quickly around practice and kickoffs
 _MAX_XML_BYTES = 1_000_000
 
 # Exclude straight NFL business/entertainment headlines unless the story itself
@@ -163,10 +163,21 @@ def _name_matches(name, title, summary=""):
     haystack = re.sub(r"[^a-z0-9 ]", " ", f"{title} {summary}".lower())
     haystack = re.sub(r"\s+", " ", haystack)
     # Accept full names or surname plus first initial, but not "Brown" alone.
+    # ESPN names may include Jr./Sr. and spaced initials; publishers often omit
+    # the suffix or spell A.J. as AJ. Do not accept just the surname.
+    if parts[-1] in {"jr", "sr", "ii", "iii", "iv"} and len(parts) > 2:
+        parts = parts[:-1]
     full = " ".join(parts)
-    return bool(re.search(r"\b" + re.escape(full) + r"\b", haystack)) or bool(
-        len(parts[-1]) >= 4 and re.search(r"\b" + re.escape(parts[0][0]) + r"\s+" + re.escape(parts[-1]) + r"\b", haystack)
-    )
+    variants = {full}
+    if len(parts) >= 3 and len(parts[0]) == len(parts[1]) == 1:
+        variants.add("".join(parts[:2]) + " " + " ".join(parts[2:]))
+    if len(parts) >= 3 and parts[0] == "wan" and parts[1] == "dale":
+        variants.add("wandale " + " ".join(parts[2:]))
+    for variant in variants:
+        if re.search(r"\b" + re.escape(variant) + r"\b", haystack):
+            return True
+    return bool(len(parts[-1]) >= 4 and
+                re.search(r"\b" + re.escape(parts[0][0]) + r"\s+" + re.escape(parts[-1]) + r"\b", haystack))
 
 
 def _espn_athlete_articles(player_id, *, fetcher):
@@ -201,10 +212,10 @@ def _espn_athlete_articles(player_id, *, fetcher):
     return result
 
 
-def _athlete_news_cached(player_id, *, fetcher=None):
+def _athlete_news_cached(player_id, *, fetcher=None, refresh=False):
     with _LOCK:
         item = _PLAYER_CACHE.get(player_id)
-        if fetcher is None and item and monotonic() - item[0] < _PLAYER_SECONDS:
+        if not refresh and fetcher is None and item and monotonic() - item[0] < _PLAYER_SECONDS:
             return item[1]
     try:
         articles = _espn_athlete_articles(player_id, fetcher=fetcher or _fetch_url)
@@ -236,7 +247,7 @@ def _google_news_url(name, *, is_search=False):
     return base + "?" + urlencode({"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"})
 
 
-def _search_player_news(name, *, fetcher, max_items=3):
+def _search_player_news(name, *, fetcher, max_items=20):
     """Query a player-specific RSS search rather than hoping a general feed
     happens to mention all 17 rostered players. Read headlines only.
     """
@@ -254,11 +265,11 @@ def _search_player_news(name, *, fetcher, max_items=3):
     return relevant[:max_items]
 
 
-def _player_search_cached(name, *, fetcher=None):
+def _player_search_cached(name, *, fetcher=None, refresh=False):
     key = ("search", name.lower())
     with _LOCK:
         entry = _PLAYER_CACHE.get(key)
-        if fetcher is None and entry and monotonic() - entry[0] < _PLAYER_SECONDS:
+        if not refresh and fetcher is None and entry and monotonic() - entry[0] < _PLAYER_SECONDS:
             return entry[1]
     try:
         articles = _search_player_news(name, fetcher=fetcher or _fetch_url)
@@ -270,54 +281,166 @@ def _player_search_cached(name, *, fetcher=None):
     return articles
 
 
-def roster_news(roster, *, feed_fetcher=None, athlete_fetcher=None, search_fetcher=None, max_players=32):
-    """Verify player-specific stories, with individual RSS searches as fallback.
+def _normalized_title(title):
+    """Ignore punctuation and common publisher suffixes when checking duplicates."""
+    raw = re.sub(r"\s+[-|]\s+(?:CBS Sports|Yahoo Sports|ESPN|NBC Sports|FantasyPros|"
+                 r"RotoWire|FTN(?: Fantasy)?|Sports Illustrated)\s*$", "", str(title or ""), flags=re.I)
+    return " ".join(re.findall(r"[a-z0-9]+", raw.casefold()))
 
-    Only called when 'My Team News' is opened. Athlete requests are bounded and
-    hourly cached. One failed source cannot hide the rest.
+
+def _canonical_link(link):
+    parsed = urlparse(str(link or ""))
+    if not parsed.hostname:
+        return ""
+    return urlunparse((parsed.scheme.lower(), parsed.hostname.lower(),
+                       parsed.path.rstrip("/"), "", "", ""))
+
+
+def _published_datetime(article):
+    value = article.get("published_at")
+    if not value:
+        return None
+    try:
+        date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return date.replace(tzinfo=timezone.utc) if date.tzinfo is None else date.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _article_score(article, player_name, injury_status, *, now):
+    """Transparent deterministic relevance + freshness score. No model calls."""
+    title = str(article.get("title") or "")
+    summary = str(article.get("summary") or "")
+    in_title = _name_matches(player_name, title)
+    in_summary = _name_matches(player_name, "", summary)
+    # Athlete endpoint is keyed by ESPN ID, though exact name mention is better.
+    identity_score = 34 if in_title else (10 if in_summary else (4 if article.get("source") == "ESPN Player News" else -20))
+    content = title + " " + summary
+    fantasy = bool(re.search(r"\b(fantasy|waiver|start.?sit|trade value|PPR|FAAB|"
+                             r"projections?|rankings?|targets?|snaps?|usage|touches|"
+                             r"workload|backfield|depth chart)\b", title, re.I))
+    action = bool(_PLAYER_NEWS_CONTEXT.search(title))
+    injury_news = bool(re.search(r"\b(injur(?:y|ed|ies)|questionable|doubtful|"
+                                 r"ruled out|inactive|practice|limited|IR|return)\b", content, re.I))
+    is_injured = str(injury_status or "").upper() not in {"", "ACTIVE", "HEALTHY", "NORMAL"}
+    published = _published_datetime(article)
+    if published:
+        age_days = max(0.0, (now - published).total_seconds() / 86400)
+        freshness = max(-60.0, 32.0 - 5.0 * age_days)
+    else:
+        freshness = -12.0  # Unverified recency must not outrank breaking reports.
+    score = identity_score + (9 if fantasy else 0) + (4 if action else 0) + freshness
+    if is_injured and injury_news:
+        score += 12
+    # Prefer the freshest genuinely relevant story. A provider's name must not
+    # outrank the same headline published later elsewhere.
+    if "Google News" not in str(article.get("source") or ""):
+        score += 0.05
+    return round(score, 3)
+
+
+def _deduplicate_and_rank(candidates, player_name, injury_status, *, now=None, max_items=20):
+    """Merge all providers before selection; don't stop at the first two results."""
+    now = now or datetime.now(timezone.utc)
+    ranked = []
+    for article in candidates:
+        title = str(article.get("title") or "")
+        link = _valid_link(article.get("url"))
+        if not title or not link or _OFF_TOPIC.search(title):
+            continue
+        # ESPN athlete endpoint identifies the player by ID; elsewhere require
+        # explicit name match. All sources must pass the on-field news gate.
+        source = str(article.get("source") or "")
+        if not (_name_matches(player_name, title, str(article.get("summary") or "")) or source == "ESPN Player News"):
+            continue
+        if not (is_fantasy_relevant(title, article.get("summary", "")) or
+                _PLAYER_NEWS_CONTEXT.search(title + " " + str(article.get("summary") or ""))):
+            continue
+        row = {"title": title, "summary": str(article.get("summary") or ""),
+               "url": link, "source": source, "published_at": article.get("published_at")}
+        row["relevance_score"] = _article_score(row, player_name, injury_status, now=now)
+        ranked.append(row)
+
+    # Keep the best candidate for the same source URL or the same story headline,
+    # including identical articles linked through Google News redirects.
+    ranked.sort(key=lambda a: (a["relevance_score"],
+                               _published_datetime(a) or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+    unique = []
+    seen_titles, seen_links = set(), set()
+    for row in ranked:
+        title_key, link_key = _normalized_title(row["title"]), _canonical_link(row["url"])
+        if not title_key or title_key in seen_titles or link_key in seen_links:
+            continue
+        # Publisher titles sometimes differ by a short added tagline.
+        tokens = set(title_key.split())
+        near_duplicate = False
+        for prev in unique:
+            other = set(_normalized_title(prev["title"]).split())
+            if min(len(tokens), len(other)) >= 6 and len(tokens & other) / len(tokens | other) >= 0.88:
+                near_duplicate = True
+                break
+        if near_duplicate:
+            continue
+        seen_titles.add(title_key)
+        seen_links.add(link_key)
+        unique.append(row)
+        if len(unique) >= max_items:
+            break
+    # Relevance score is an internal ordering signal; omit arbitrary numeric ranks
+    # from user-facing articles to avoid implying a calibrated prediction.
+    for row in unique:
+        row.pop("relevance_score", None)
+    return unique
+
+
+def roster_news(roster, *, feed_fetcher=None, athlete_fetcher=None,
+                search_fetcher=None, max_players=32, refresh=False):
+    """Search *all* sources, then rank/deduplicate before choosing top stories.
+
+    Includes up to 20 articles per player. The frontend shows the top two with
+    an expandable 'View all' option. Searches are cached for 15 minutes unless
+    explicitly refreshed, and never invoke Claude or paid FantasyPros APIs.
     """
-    feed = _get_feed(fetcher=feed_fetcher)
-    player_rows = []
-    unresolved = []
+    feed = _get_feed(fetcher=feed_fetcher, refresh=refresh)
+    now = datetime.now(timezone.utc)
+    rows = []
     for player in list(roster or [])[:max_players]:
         name = str(player.get("name") or "").strip()
         if not name:
             continue
-        matches = [a for a in feed["articles"] if _name_matches(name, a["title"], a["summary"])]
-        matches = sorted(matches, key=lambda a: ("injur" in a["title"].lower() or "practice" in a["title"].lower()) if str(player.get("injury_status") or "").upper() not in {"", "ACTIVE", "HEALTHY"} else False, reverse=True)
-        row = {"name": name, "position": player.get("position"),
-               "coverage_url": _google_news_url(name, is_search=True),
-               "injury_status": player.get("injury_status"),
-               "espn_id": player.get("espn_id"), "articles": matches[:2],
-               "status": "available" if matches else "not_found"}
-        player_rows.append(row)
-        if not matches:
-            unresolved.append(row)
-    # First use ESPN's athlete-specific data for actual players, then Google
-    # News RSS search for *each still-unmatched player*. Searches are limited
-    # to the current roster and run only when the user opens this tab.
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(_athlete_news_cached, row["espn_id"], fetcher=athlete_fetcher): row
-                   for row in unresolved if isinstance(row.get("espn_id"), int) and row["espn_id"] > 0}
+        rows.append({"name": name, "position": player.get("position"),
+                     "coverage_url": _google_news_url(name, is_search=True),
+                     "injury_status": player.get("injury_status"),
+                     "espn_id": player.get("espn_id"), "articles": [],
+                     "status": "not_found", "_candidates": [a for a in feed["articles"]
+                                                       if _name_matches(name, a["title"], a["summary"])]})
+
+    # Don't conditionally skip ESPN or Google just because a broad feed happened
+    # to contain two older stories. Collect all and rank the combined pool.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {}
+        for row in rows:
+            pid = row["espn_id"]
+            if isinstance(pid, int) and pid > 0:
+                future = pool.submit(_athlete_news_cached, pid, fetcher=athlete_fetcher, refresh=refresh)
+                futures[future] = row
+            future = pool.submit(_player_search_cached, row["name"], fetcher=search_fetcher, refresh=refresh)
+            futures[future] = row
         for future in as_completed(futures):
-            row = futures[future]
             try:
-                row["articles"] = future.result()[:2]
+                futures[future]["_candidates"].extend(future.result())
             except Exception:
-                row["articles"] = []
-            row["status"] = "available" if row["articles"] else "not_found"
-    pending = [row for row in unresolved if not row["articles"]]
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(_player_search_cached, row["name"], fetcher=search_fetcher): row for row in pending}
-        for future in as_completed(futures):
-            row = futures[future]
-            try:
-                row["articles"] = future.result()[:2]
-            except Exception:
-                row["articles"] = []
-            row["status"] = "available" if row["articles"] else "not_found"
-    return {"status": "available" if player_rows else "unavailable", "players": player_rows,
-            "matched_players": sum(bool(row["articles"]) for row in player_rows),
-            "total_players": len(player_rows),
-            "note": "Roster-specific ESPN and Google News searches provide player coverage. Real articles are labeled; players without a verified article get a direct news search link, never a fabricated headline. Searches are hourly cached.",
+                pass  # Failed sources cannot hide verified stories from other sources.
+
+    for row in rows:
+        row["articles"] = _deduplicate_and_rank(
+            row.pop("_candidates"), row["name"], row.get("injury_status"), now=now)
+        row["status"] = "available" if row["articles"] else "not_found"
+
+    return {"status": "available" if rows else "unavailable", "players": rows,
+            "matched_players": sum(bool(row["articles"]) for row in rows),
+            "total_players": len(rows),
+            "refreshed_at": now.isoformat(),
+            "ranking_method": "Player relevance, article freshness, injury relevance, duplicate removal",
+            "note": "Articles from all available feeds, ESPN player news and Google News are ranked together; the top two are shown first. Older stories and repeated headlines are deprioritized. Click View all to browse more. No Claude or paid FantasyPros calls.",
             "feed_status": feed["status"]}
