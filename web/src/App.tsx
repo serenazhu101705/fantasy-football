@@ -3,7 +3,7 @@ import type { FormEvent, ReactNode } from 'react'
 import { Activity, ArrowRight, Bot, Check, ChevronDown, CircleAlert, ClipboardList, Clock3, LayoutDashboard, MessageCircle, Newspaper, RefreshCw, Send, X, ShieldCheck, Sparkles, TrendingUp, Trophy, Users, Zap } from 'lucide-react'
 import { ApiError, post, request } from './api'
 import type { CoachReply, LeagueData, LineupData, Player, WaiverData, MatchupStrategy,
-  StandingsData, FaabData, ScheduleData, TransactionData, TeamRosterData, ClaimsData, LeagueMatchupsData, NewsData, RosterNewsData, MatchupPlayer, PlayerProfile, PlayerAnalysis, StatLine } from './api' 
+  StandingsData, FaabData, ScheduleData, TransactionData, TeamRosterData, ClaimsData, LeagueMatchupsData, NewsData, RosterNewsData, MatchupPlayer, PlayerProfile, PlayerAnalysis, StatLine, WeeklyRecap, WeeklyRecapStatus } from './api' 
 
 type Tab = 'overview' | 'roster' | 'waivers' | 'lineup' | 'matchup' | 'league' | 'feed'
 type Message = { id: number, role: 'user' | 'assistant', text: string, usage?: CoachReply }
@@ -96,9 +96,9 @@ function PlayerDrawer({ selected, onClose, week }: {selected:{id:number,name:str
         <h3>Season NFL stats <small className="detail-muted">({profile.stat_coverage_weeks || 0} weeks of ESPN breakdowns available)</small></h3><StatGrid stats={profile.available_weeks_stat_totals} empty="ESPN has not supplied a weekly statistical breakdown to total for this player." />
         <h3>This week's actual NFL stats</h3><StatGrid stats={profile.current_week.stats} empty="No verified stats yet for this week." />
         <h3>This week's projected NFL stats</h3><StatGrid stats={profile.current_week.projected_stats} empty="ESPN did not provide a projected stat breakdown." />
-        <h3>Last completed game {profile.last_completed_game ? `· Week ${profile.last_completed_game.week}` : ''}</h3>
-        {profile.last_completed_game ? <><p className="detail-muted">{points(profile.last_completed_game.fantasy_points)} fantasy points</p><StatGrid stats={profile.last_completed_game.stats}/></> : <p className="detail-muted">No completed-game stat breakdown available.</p>}
-        <h3>Recent fantasy scores</h3><div className="recent-game-list">{profile.recent_games.length ? profile.recent_games.map(g=><span key={g.week}>W{g.week}: <strong>{points(g.fantasy_points)}</strong></span>) : <p className="detail-muted">No prior games available.</p>}</div>
+        <h3>Last completed game {profile.last_completed_game?.week ? `· Week ${profile.last_completed_game.week}` : profile.last_completed_game?.game_date ? `· ${new Date(profile.last_completed_game.game_date).toLocaleDateString()}` : ''}</h3>
+        {profile.last_completed_game ? <><p className="detail-muted">{profile.last_completed_game.fantasy_points != null ? `${points(profile.last_completed_game.fantasy_points)} fantasy points` : 'NFL stats from ESPN game log · fantasy scoring not available for this entry'}</p><StatGrid stats={profile.last_completed_game.stats}/></> : <p className="detail-muted">No completed-game stat breakdown available.</p>}
+        <h3>Recent fantasy scores</h3><div className="recent-game-list">{profile.recent_games.length ? profile.recent_games.map(g=><span key={g.week || g.game_date}>{g.week ? `W${g.week}` : g.game_date ? new Date(g.game_date).toLocaleDateString() : 'Game'}: <strong>{g.fantasy_points != null ? `${points(g.fantasy_points)} fantasy pts` : 'NFL game log'}</strong></span>) : <p className="detail-muted">No prior games available.</p>}</div>
         <div className="claude-player-card"><div><span className="panel-kicker">OPTIONAL · USES CLAUDE TOKENS</span><h3>Personalized player breakdown</h3><p>A short explanation of the last game, season performance, and this week's outlook, using ESPN facts.</p></div>
           {!analysis && <button className="button-action" disabled={analyzing} onClick={()=>void generate()}>{analyzing?'Analyzing…':'Analyze with Claude'} <Sparkles size={14}/></button>}
           {analysisError && <p className="detail-error">{analysisError}</p>}
@@ -134,6 +134,11 @@ export default function App() {
   const [feedTab, setFeedTab] = useState<'fantasy'|'team'>('fantasy')
   const [rosterNews, setRosterNews] = useState<RosterNewsData | null>(null)
   const [rosterNewsError, setRosterNewsError] = useState('')
+  const [recapWeek, setRecapWeek] = useState<number | null>(null)
+  const [recapStatus, setRecapStatus] = useState<WeeklyRecapStatus | null>(null)
+  const [recap, setRecap] = useState<WeeklyRecap | null>(null)
+  const [recapError, setRecapError] = useState('')
+  const [generatingRecap, setGeneratingRecap] = useState(false)
   const [transactions, setTransactions] = useState<TransactionData | null>(null)
   const [leagueErrors, setLeagueErrors] = useState<Record<string,string>>({})
   const [claims, setClaims] = useState<ClaimsData | null>(null)
@@ -187,6 +192,34 @@ export default function App() {
     const interval = tab === 'matchup' ? window.setInterval(load, 60_000) : null
     return () => { cancelled = true; if (interval != null) window.clearInterval(interval) }
   }, [league, tab])
+  useEffect(() => {
+    if (tab !== 'matchup' || !league) return
+    let cancelled=false
+    const wk = recapWeek ?? league.week
+    const load=()=>{
+      if (document.visibilityState !== 'hidden') {
+        request<WeeklyRecapStatus>(`/api/recaps/week?week=${wk}`)
+          .then(data=>{if(!cancelled){setRecapStatus(data);setRecapError('')}})
+          .catch(err=>{if(!cancelled)setRecapError(err instanceof Error?err.message:'Recap status unavailable')})
+      }
+    }
+    setRecapStatus(null)
+    load()
+    const interval=window.setInterval(load,60_000)
+    return ()=>{cancelled=true;window.clearInterval(interval)}
+  },[tab,league,recapWeek])
+
+  async function generateRecap() {
+    if(!league||generatingRecap)return
+    setGeneratingRecap(true);setRecapError('')
+    try{
+      const week=recapWeek ?? league.week
+      const result=await post<WeeklyRecap>(`/api/recaps/week?week=${week}`)
+      setRecap(result)
+    }catch(err){setRecapError(err instanceof Error?err.message:'Weekly recap unavailable')}
+    finally{setGeneratingRecap(false)}
+  }
+
   useEffect(() => {
     if (tab !== 'league') return
     let cancelled = false
@@ -297,6 +330,8 @@ export default function App() {
       setSchedule(null)
       setNews(null)
       setRosterNews(null)
+      setRecapStatus(null)
+      setRecap(null)
       setTransactions(null)
       setOpponentRoster(null)
       setSelectedTeam(null)
@@ -423,6 +458,18 @@ export default function App() {
             <p className="panel-description">Lineup swaps are alternatives, not additive. Confirm kickoff/lock status on ESPN before acting.</p>
             <button className="button-action padded-button" onClick={()=>void send(undefined,'What do I need to do to win this week, using my opponent projections and lineup?')}>Ask Claude for a game plan <ArrowRight size={14}/></button>
           </>}
+          <div className="recap-panel">
+            <div className="recap-heading"><div><span className="panel-kicker">POSTGAME · CLAUDE</span><h2>Weekly recap</h2></div>
+              <label>Week <select value={recapWeek ?? league?.week ?? 1} onChange={e=>{setRecapWeek(Number(e.target.value));setRecap(null);setRecapStatus(null);setRecapError('')}}>
+                {Array.from({length:league?.week || 1},(_,i)=>i+1).map(w=><option key={w} value={w}>{w}</option>)}
+              </select></label>
+            </div>
+            <p className="panel-description">A recap unlocks once the final NFL game of the selected week is finished and ESPN Fantasy has reported both teams' scores. Checking the status is free.</p>
+            <p className="panel-description">{recapStatus?.note || (recapError ? '' : 'Checking ESPN game results…')}</p>
+            {recapStatus?.status==='ready' && !recap && <button className="button-action" onClick={()=>void generateRecap()} disabled={generatingRecap}>{generatingRecap?'Generating…':recapStatus.cached?'View saved recap (free)':'Generate recap with Claude (1 call)'} <Sparkles size={14}/></button>}
+            {recapError && <p className="detail-error">{recapError}</p>}
+            {recap && <div className="recap-result"><RichText text={recap.analysis}/><p className="detail-muted">Week {recap.week} · {recap.cached?'Saved locally · no new tokens':`${(recap.input_tokens+recap.output_tokens).toLocaleString()} tokens · 1 Claude call`}</p></div>}
+          </div>
         </section>}
 
         {tab==='league' && <section className="panel full-panel league-details">
@@ -492,12 +539,13 @@ export default function App() {
               <div className="roster-news-heading"><strong>{p.name}</strong><span>{p.position || 'Player'}</span>{p.injury_status && p.injury_status!=='ACTIVE' && <span className="injury">{p.injury_status}</span>}
                 {p.espn_id != null && <button className="subtle-link" onClick={()=>openPlayer(p.espn_id!,p.name)}>Stats & profile ↗</button>}</div>
               {p.articles.length ? p.articles.map(a=><a key={a.url} className="news-card" href={a.url} rel="noopener noreferrer" target="_blank"><div className="news-meta"><span>{a.source}</span><time>{a.published_at?new Date(a.published_at).toLocaleDateString():'Date unavailable'}</time></div><h3>{a.title}</h3>{a.summary && <p>{a.summary}</p>}<small>Read article ↗</small></a>)
-                : <p className="detail-muted">No recent verified fantasy article for this player. This does not mean they have no relevant NFL news.</p>}
+                : <p className="detail-muted">No verified article found in the available feeds. <a href={p.coverage_url} target="_blank" rel="noopener noreferrer">Search latest {p.name} fantasy coverage ↗</a></p>}
+              {p.articles.length>0 && p.coverage_url && <a className="news-more-link" href={p.coverage_url} target="_blank" rel="noopener noreferrer">More {p.name} articles ↗</a>}
             </div>)}</div>
           </>}
         </section>}
 
-        <section className="chat-panel" aria-label="Fantasy Coach chat"><div className="chat-heading"><div className="coach-avatar"><Bot size={23}/></div><div><div className="coach-label"><h2>Ask Fantasy Coach</h2><span className="available"><span/> Ready to analyze</span></div><p>Personalized strategy, powered by your league data.</p></div><span className="chat-model">CLAUDE · v7.14</span></div>
+        <section className="chat-panel" aria-label="Fantasy Coach chat"><div className="chat-heading"><div className="coach-avatar"><Bot size={23}/></div><div><div className="coach-label"><h2>Ask Fantasy Coach</h2><span className="available"><span/> Ready to analyze</span></div><p>Personalized strategy, powered by your league data.</p></div><span className="chat-model">CLAUDE · v7.15</span></div>
           <div className="chat-body">{messages.length===0 ? <div className="chat-welcome"><div className="chat-welcome-icon"><MessageCircle size={21}/></div><h3>What are we figuring out today?</h3><p>Compare players, explore waivers, or ask for the best move for your roster.</p><div className="suggestions">{SUGGESTIONS.map(s=><button onClick={()=>void send(undefined,s)} key={s} disabled={sending}>{s}<ArrowRight size={13}/></button>)}</div></div> : <div className="messages">{messages.map(message=><div className={`message ${message.role}`} key={message.id}><div className="message-avatar">{message.role === 'assistant' ? <Bot size={17}/> : <span>YOU</span>}</div><div className="message-main"><div className="message-author">{message.role === 'assistant' ? 'Fantasy Coach' : 'You'}</div><RichText text={message.text}/>{message.usage && <span className="usage"><Check size={12}/>{moneyTokens(message.usage)}</span>}</div></div>)}{sending && <div className="typing"><span/><span/><span/> Analyzing league data…</div>}<div ref={chatBottom}/></div>}</div>
           {chatError && <div className="chat-error"><CircleAlert size={15}/>{chatError}</div>}
           <form className="composer" onSubmit={e=>void send(e)}><textarea id="coach-input" rows={2} maxLength={2000} placeholder="Ask about your lineup, trades, waivers, or player value…" value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter' && !e.shiftKey){e.preventDefault();void send()}}} disabled={sending}/><button aria-label="Send message" type="submit" disabled={sending || !input.trim()}>{sending ? <Clock3 size={19}/> : <Send size={19}/>}</button></form><div className="composer-foot"><span><ShieldCheck size={12}/> ESPN-derived scoring · No data guesswork</span><span>ENTER TO SEND <ChevronDown size={12}/> SHIFT+ENTER FOR NEW LINE</span></div>

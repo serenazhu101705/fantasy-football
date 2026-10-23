@@ -125,7 +125,7 @@ def _league_feature(operation):
 
 def create_app(engine_loader: Callable | None = None) -> FastAPI:
     host = EngineHost(engine_loader or (lambda: import_module("llm")))
-    api = FastAPI(title="Fantasy Coach API", version="7.14.0", docs_url="/docs")
+    api = FastAPI(title="Fantasy Coach API", version="7.15.0", docs_url="/docs")
     api.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -280,12 +280,15 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         from matchup_live import player_profile
         with host.lock:
             league, _ = _espn_context(host.ensure_ready())
-            try:
-                return player_profile(league, player_id, week)
-            except ValueError as exc:
-                raise HTTPException(status_code=404, detail=str(exc)) from None
-            except Exception as exc:
-                raise HTTPException(status_code=503, detail=f"Player profile unavailable ({type(exc).__name__}).") from None
+        # Public bio/stats network I/O must not hold the engine/chat lock.
+        try:
+            return player_profile(league, player_id, week)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except Exception as exc:
+            if os.getenv("FANTASY_DEBUG") == "1":
+                print(f"[PLAYER PROFILE] error={type(exc).__name__}")
+            raise HTTPException(status_code=503, detail=f"Player profile unavailable ({type(exc).__name__}).") from None
 
     @api.post("/api/players/{player_id}/analysis")
     def generate_player_analysis(player_id: int, week: int | None = Query(default=None, ge=1, le=18)):
@@ -295,14 +298,56 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         with host.lock:
             engine = host.ensure_ready()
             league, _ = _espn_context(engine)
-            try:
-                profile = player_profile(league, player_id, week)
-            except ValueError as exc:
-                raise HTTPException(status_code=404, detail=str(exc)) from None
-            try:
-                return summarize_player(profile, engine.client, engine.MODEL)
-            except Exception as exc:
-                raise HTTPException(status_code=502, detail=f"Claude player analysis unavailable ({type(exc).__name__}).") from None
+            client, model = engine.client, engine.MODEL
+        # Claude requests are independent of CLI conversation global state.
+        # Do not block roster/chat/matchup requests during the network call.
+        try:
+            profile = player_profile(league, player_id, week)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Player profile unavailable ({type(exc).__name__}).") from None
+        try:
+            return summarize_player(profile, client, model)
+        except Exception as exc:
+            # Minimal operational diagnostics: no prompts, keys, headers or
+            # private roster data in logs or HTTP responses.
+            if os.getenv("FANTASY_DEBUG") == "1":
+                print(f"[PLAYER ANALYSIS] error={type(exc).__name__} http_status={getattr(exc, 'status_code', 'n/a')}")
+            code = getattr(exc, "status_code", None)
+            if code == 429:
+                detail = "Claude is rate-limited or out of credits (HTTP 429)."
+            elif code == 401:
+                detail = "Claude API authentication failed (HTTP 401). Check server credentials."
+            elif code in (400, 404):
+                detail = f"Claude rejected the player-summary model/request (HTTP {code}). Check ANTHROPIC_MODEL."
+            else:
+                detail = f"Claude player analysis unavailable ({type(exc).__name__}). See backend log with FANTASY_DEBUG=1."
+            raise HTTPException(status_code=502, detail=detail) from None
+
+    @api.get("/api/recaps/week")
+    def get_recap_status(week: int | None = Query(default=None, ge=1, le=18)):
+        from weekly_recap import recap_status
+        with host.lock:
+            league, team = _espn_context(host.ensure_ready())
+            return _league_feature(lambda: recap_status(league, team.team_id, week))
+
+    @api.post("/api/recaps/week")
+    def post_weekly_recap(week: int | None = Query(default=None, ge=1, le=18)):
+        """Opt-in paid Claude recap; never call until all NFL games are final."""
+        from weekly_recap import generate_weekly_recap
+        with host.lock:
+            engine = host.ensure_ready()
+            league, team = _espn_context(engine)
+            client, model = engine.client, engine.MODEL
+        try:
+            return generate_weekly_recap(league, team.team_id, client, model, week)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except Exception as exc:
+            if os.getenv("FANTASY_DEBUG") == "1":
+                print(f"[WEEKLY RECAP] error={type(exc).__name__} http_status={getattr(exc, 'status_code', 'n/a')}")
+            raise HTTPException(status_code=502, detail=f"Weekly recap unavailable ({type(exc).__name__}).") from None
 
     @api.post("/api/chat")
     def chat(body: ChatRequest, x_fantasy_session: str | None = Header(default=None)):
@@ -331,6 +376,8 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             from league_intelligence import clear_cache
             from matchup_live import clear_live_cache
             from player_analysis import clear_analysis_cache
+            from espn_player_stats import clear_public_player_cache
+            clear_public_player_cache()
             clear_cache()
             clear_live_cache()
             clear_analysis_cache()

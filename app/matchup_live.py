@@ -195,15 +195,44 @@ def _clean_breakdown(value):
     if not isinstance(value, dict):
         return []
     pairs = []
+    # espn-api occasionally leaves derived ESPN stat IDs (47, 48, 210, etc.)
+    # in the breakdown. They are scoring counters, not standalone NFL stats.
+    # Prefer verified base-stat IDs only; unknown IDs are never shown raw.
+    numeric = {
+        "0": "Pass attempts", "1": "Completions", "3": "Passing yards",
+        "4": "Passing TD", "20": "Interceptions", "23": "Carries",
+        "24": "Rushing yards", "25": "Rushing TD", "41": "Receptions",
+        "42": "Receiving yards", "43": "Receiving TD", "58": "Targets",
+        "59": "Receiving yards after catch", "60": "Receiving yards per reception",
+        "72": "Fumbles lost", "86": "Extra points made", "99": "Defensive sacks",
+        "210": "Games played", "213": "Receiving first downs",
+    }
+    # ESPN duplicates certain counters under different IDs; avoid counting twice.
+    alternate_ids = {"22": "3", "40": "24", "53": "41", "61": "42"}
+    present = {str(k) for k in value}
     for key, raw in value.items():
         val = _number(raw)
         if val is None or (abs(val) < 0.001):
             continue
-        label = _STAT_NAMES.get(str(key))
-        if not label:
-            label = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(key)).replace("_", " ").capitalize()
-        pairs.append({"key": str(key), "label": label, "value": val})
-    return pairs[:32]
+        code = str(key)
+        if code in alternate_ids and alternate_ids[code] in present:
+            continue
+        if code.isdigit():
+            label = numeric.get(code) or (numeric.get(alternate_ids[code]) if code in alternate_ids else None)
+            if label is None:
+                continue
+        else:
+            label = _STAT_NAMES.get(code)
+            if not label:
+                label = re.sub(r"([a-z])([A-Z])", r"\1 \2", code).replace("_", " ").capitalize()
+        pairs.append({"key": code, "label": label, "value": val})
+    # Keep named/base football stats over duplicated derived ESPN IDs.
+    unique = {}
+    for pair in pairs:
+        label = pair["label"]
+        if label not in unique or (unique[label]["key"].isdigit() and not pair["key"].isdigit()):
+            unique[label] = pair
+    return list(unique.values())[:32]
 
 
 def player_profile(league, player_id, week):
@@ -265,6 +294,19 @@ def player_profile(league, player_id, week):
     # Totals only reflect the weekly breakdowns ESPN returned, not necessarily
     # the full season. Never label sparse data as complete season statistics.
     season_stats = _clean_breakdown(dict(season_totals))
+    # ESPN Fantasy league roster stats can omit most of the season. Prefer
+    # independently published NFL season totals; never present 1-week data as
+    # an entire season. Failure to retrieve public stats preserves the fallback.
+    from espn_player_stats import public_player_data
+    year = int(getattr(league, "year", 0) or getattr(league, "season", 0) or 2026)
+    public = public_player_data(player_id, year)
+    full_stats = public["season_stats"]
+    if full_stats:
+        season_stats = full_stats
+    if len(history) < 2 and public["recent_games"]:
+        # Public NFL game logs have real NFL stat lines but not ESPN fantasy
+        # points. Never invent fantasy scores from generic NFL stats.
+        history = [{**g, "week": None} for g in public["recent_games"]]
     season_points = _number(getattr(roster_player or player, "total_points", None))
     season_avg = _number(getattr(roster_player or player, "avg_points", None))
     season_games = len(history)
@@ -280,6 +322,8 @@ def player_profile(league, player_id, week):
             "season_games_in_loaded_stats": season_games,
             "available_weeks_stat_totals": season_stats,
             "stat_coverage_weeks": stat_weeks,
+            "season_stats_source": public["stats_source"] if full_stats else ("Partial ESPN Fantasy weekly breakdowns" if stat_weeks else "unavailable"),
+            "season_stats_complete": bool(full_stats),
             "bio": player_public_bio(player_id),
             "current_week": {"projected_points": current_proj,
                              "fantasy_points": current_points,

@@ -73,3 +73,12 @@
 .roster-news-heading .subtle-link{margin-left:auto;font-size:10px;color:#bdf68b}
 .roster-news-player .news-card{display:block;padding:12px 14px;margin:0}
 .bio-strip{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:14px}.bio-strip span{font-size:11px;padding:5px 9px;background:#213743;border:1px solid #365566;border-radius:6px;color:#c1d8e5}
+
+/* v7.15: recap appears when ESPN marks every game final */
+.recap-panel{margin:18px 24px 25px;padding:20px;background:#1b2c35;border:1px solid #425b55;border-radius:12px}
+.recap-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.recap-heading h2{margin:7px 0;font-size:18px}
+.recap-heading label{font-size:12px;color:#b1c9cc;display:flex;align-items:center;gap:8px}
+.recap-heading select{background:#233a42;color:#eef5f5;border:1px solid #557267;border-radius:7px;padding:6px}
+.recap-result{border-top:1px solid #3d5a54;margin-top:18px;padding-top:13px;line-height:1.7;font-size:13px}
+.news-more-link,.roster-news-player .detail-muted a{color:#b5f68c;text-decoration:underline;text-underline-offset:3px;font-size:11px}

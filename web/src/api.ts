@@ -187,6 +187,7 @@ export interface RosterNewsData {
     injury_status?:string|null
     espn_id?:number|null
     status:'available'|'not_found'
+    coverage_url?:string
     articles:NewsData['articles']
   }>
 }
@@ -225,11 +226,13 @@ export interface PlayerProfile {
   season_fantasy_ppg: number | null
   season_games_in_loaded_stats: number
   stat_coverage_weeks?:number
+  season_stats_source?:string
+  season_stats_complete?:boolean
   available_weeks_stat_totals?:StatLine[]
   bio?: {height?:string,weight?:string,age?:number,college?:string,years_pro?:number,jersey?:string,source?:string}
   current_week: {projected_points:number|null,fantasy_points:number|null,stats:StatLine[],projected_stats:StatLine[]}
-  last_completed_game: {week:number,fantasy_points:number|null,stats:StatLine[]} | null
-  recent_games: Array<{week:number,fantasy_points:number|null,stats:StatLine[]}>
+  last_completed_game: {week:number|null,game_date?:string|null,opponent?:string|null,fantasy_points:number|null,stats:StatLine[]} | null
+  recent_games: Array<{week:number|null,game_date?:string|null,opponent?:string|null,fantasy_points:number|null,stats:StatLine[]}>
   source:string
   note?:string
 }
@@ -240,4 +243,23 @@ export interface PlayerAnalysis {
   input_tokens:number
   output_tokens:number
   note?:string
+}
+
+export interface WeeklyRecapStatus {
+  season:number
+  week:number
+  status:'ready'|'game_status_unavailable'|'schedule_incomplete'|'games_in_progress'|'matchup_unavailable'|'fantasy_scores_pending'
+  nfl_games_seen?:number
+  cached:boolean
+  note:string
+}
+export interface WeeklyRecap {
+  season:number
+  week:number
+  analysis:string
+  source:string
+  generated_at:string
+  cached:boolean
+  input_tokens:number
+  output_tokens:number
 }

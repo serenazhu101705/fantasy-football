@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from threading import RLock
 from time import monotonic
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 import json
@@ -24,7 +24,7 @@ SOURCES = (
 )
 _LOCK = RLock()
 _CACHE = None
-_PLAYER_CACHE: dict[int, tuple[float, list]] = {}
+_PLAYER_CACHE: dict[tuple, tuple[float, list]] = {}
 _CACHE_SECONDS = 15 * 60
 _PLAYER_SECONDS = 60 * 60
 _MAX_XML_BYTES = 1_000_000
@@ -79,8 +79,10 @@ def _parse_rss(xml, source):
         link = _valid_link(item.findtext("link"))
         if not title or not link:
             continue
+        publisher = _plain(item.findtext("source")) if source == "Google News" else ""
         items.append({"title": title[:200], "summary": _plain(item.findtext("description"))[:240],
-                      "url": link, "source": source, "published_at": _date(item.findtext("pubDate"))})
+                      "url": link, "source": (publisher + " · Google News" if publisher else source),
+                      "published_at": _date(item.findtext("pubDate"))})
     return items
 
 
@@ -132,6 +134,11 @@ def news_feed(*, limit=24, fetcher=None, refresh=False):
 
 
 def _name_matches(name, title, summary=""):
+    # A fantasy D/ST is a team, not a person, and articles use the team name.
+    if re.search(r"(?:D/ST|DST|defen[sc]e)", name or "", re.I):
+        team = re.sub(r"\s*(?:D/ST|DST|defen[sc]e)\s*", "", name, flags=re.I).strip().lower()
+        hay = (title + " " + summary).lower()
+        return bool(team and team in hay and re.search(r"\b(defen[sc]e|dst|d/st|sack|turnover|fantasy)\b", hay))
     clean = re.sub(r"[^a-z0-9 ]", " ", (name or "").lower())
     parts = clean.split()
     if len(parts) < 2:
@@ -149,14 +156,21 @@ def _espn_athlete_articles(player_id, *, fetcher):
     raw = fetcher(f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/athletes/{int(player_id)}/news?limit=12")
     data = json.loads(raw)
     result = []
-    for article in data.get("articles", [])[:12]:
+    articles = data.get("articles", [])
+    if not isinstance(articles, list):
+        articles = []
+    for article in articles[:12]:
         title = _plain(article.get("headline") or article.get("title"))
         links = article.get("links") or {}
         web = links.get("web") or {}
         url = _valid_link(web.get("href") or article.get("link"))
         summary = _plain(article.get("story") or article.get("description"))[:240]
         date = article.get("published") or article.get("lastModified")
-        if not title or not url or not is_fantasy_relevant(title, summary):
+        # Athlete-specific ESPN stories need not contain an explicit 'fantasy'
+        # keyword, but can't be unrelated off-field news.
+        if not title or not url or _OFF_TOPIC.search(title):
+            continue
+        if not (_PLAYER_NEWS_CONTEXT.search(title + " " + summary) or is_fantasy_relevant(title, summary)):
             continue
         try:
             when = datetime.fromisoformat(str(date).replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -185,8 +199,62 @@ def _athlete_news_cached(player_id, *, fetcher=None):
     return articles
 
 
-def roster_news(roster, *, feed_fetcher=None, athlete_fetcher=None, max_players=32):
-    """Best real story for every rostered player when available; never manufacture one.
+
+
+_PLAYER_NEWS_CONTEXT = re.compile(
+    r"\b(fantasy|injur|practice|questionable|touchdowns?|targets?|carries|"
+    r"receiv|pass|rushing|rush|yards?|start|sit|week\s+\d+|waiver|"
+    r"performance|outlook|rankings?|lineup|playing|inactive|report|"
+    r"return|backfield|projection|analys|stats|snap|breakout|depth|"
+    r"traded|benched)\b", re.I
+)
+
+
+def _google_news_url(name, *, is_search=False):
+    target = name
+    if re.search(r"(?:D/ST|DST)", name, re.I):
+        target = re.sub(r"\s*(?:D/ST|DST)\s*", "", name, flags=re.I).strip() + " defense"
+    query = f'"{target}" fantasy football NFL'
+    base = "https://news.google.com/search" if is_search else "https://news.google.com/rss/search"
+    return base + "?" + urlencode({"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+
+
+def _search_player_news(name, *, fetcher, max_items=3):
+    """Query a player-specific RSS search rather than hoping a general feed
+    happens to mention all 17 rostered players. Read headlines only.
+    """
+    raw = fetcher(_google_news_url(name))
+    rows = _parse_rss(raw, "Google News")
+    relevant = []
+    for entry in rows:
+        if not _name_matches(name, entry["title"], entry["summary"]):
+            continue
+        if _OFF_TOPIC.search(entry["title"]):
+            continue
+        if not (_PLAYER_NEWS_CONTEXT.search(entry["title"]) or is_fantasy_relevant(entry["title"], entry["summary"])):
+            continue
+        relevant.append(entry)
+    return relevant[:max_items]
+
+
+def _player_search_cached(name, *, fetcher=None):
+    key = ("search", name.lower())
+    with _LOCK:
+        entry = _PLAYER_CACHE.get(key)
+        if fetcher is None and entry and monotonic() - entry[0] < _PLAYER_SECONDS:
+            return entry[1]
+    try:
+        articles = _search_player_news(name, fetcher=fetcher or _fetch_url)
+    except Exception:
+        articles = []
+    if fetcher is None:
+        with _LOCK:
+            _PLAYER_CACHE[key] = (monotonic(), articles)
+    return articles
+
+
+def roster_news(roster, *, feed_fetcher=None, athlete_fetcher=None, search_fetcher=None, max_players=32):
+    """Verify player-specific stories, with individual RSS searches as fallback.
 
     Only called when 'My Team News' is opened. Athlete requests are bounded and
     hourly cached. One failed source cannot hide the rest.
@@ -201,17 +269,31 @@ def roster_news(roster, *, feed_fetcher=None, athlete_fetcher=None, max_players=
         matches = [a for a in feed["articles"] if _name_matches(name, a["title"], a["summary"])]
         matches = sorted(matches, key=lambda a: ("injur" in a["title"].lower() or "practice" in a["title"].lower()) if str(player.get("injury_status") or "").upper() not in {"", "ACTIVE", "HEALTHY"} else False, reverse=True)
         row = {"name": name, "position": player.get("position"),
+               "coverage_url": _google_news_url(name, is_search=True),
                "injury_status": player.get("injury_status"),
                "espn_id": player.get("espn_id"), "articles": matches[:2],
                "status": "available" if matches else "not_found"}
         player_rows.append(row)
-        if not matches and isinstance(player.get("espn_id"), int) and player["espn_id"] > 0:
+        if not matches:
             unresolved.append(row)
-    # Network calls are bounded by actual roster size and only on explicit tab open.
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        future_map = {pool.submit(_athlete_news_cached, row["espn_id"], fetcher=athlete_fetcher): row for row in unresolved}
-        for future in as_completed(future_map):
-            row = future_map[future]
+    # First use ESPN's athlete-specific data for actual players, then Google
+    # News RSS search for *each still-unmatched player*. Searches are limited
+    # to the current roster and run only when the user opens this tab.
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_athlete_news_cached, row["espn_id"], fetcher=athlete_fetcher): row
+                   for row in unresolved if isinstance(row.get("espn_id"), int) and row["espn_id"] > 0}
+        for future in as_completed(futures):
+            row = futures[future]
+            try:
+                row["articles"] = future.result()[:2]
+            except Exception:
+                row["articles"] = []
+            row["status"] = "available" if row["articles"] else "not_found"
+    pending = [row for row in unresolved if not row["articles"]]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_player_search_cached, row["name"], fetcher=search_fetcher): row for row in pending}
+        for future in as_completed(futures):
+            row = futures[future]
             try:
                 row["articles"] = future.result()[:2]
             except Exception:
@@ -220,5 +302,5 @@ def roster_news(roster, *, feed_fetcher=None, athlete_fetcher=None, max_players=
     return {"status": "available" if player_rows else "unavailable", "players": player_rows,
             "matched_players": sum(bool(row["articles"]) for row in player_rows),
             "total_players": len(player_rows),
-            "note": "Stories are real publisher links. Not every player has a recent fantasy-relevant article; missing coverage is labeled explicitly. ESPN player lookup is cached for one hour.",
+            "note": "Roster-specific ESPN and Google News searches provide player coverage. Real articles are labeled; players without a verified article get a direct news search link, never a fabricated headline. Searches are hourly cached.",
             "feed_status": feed["status"]}

@@ -19,6 +19,7 @@ def _facts(profile):
     return {key: profile.get(key) for key in (
         "name", "nfl_team", "position", "injury_status", "week",
         "season_fantasy_points", "season_fantasy_ppg", "bio",
+        "season_stats_source", "season_stats_complete",
         "available_weeks_stat_totals", "stat_coverage_weeks", "current_week",
         "last_completed_game", "recent_games"
     )}
