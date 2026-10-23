@@ -253,7 +253,7 @@ export interface PlayerProfile {
   bio?: {height?:string,weight?:string,age?:number,college?:string,years_pro?:number,jersey?:string,source?:string}
   current_week: {projected_points:number|null,fantasy_points:number|null,stats:StatLine[],projected_stats:StatLine[]}
   last_completed_game: {week:number|null,game_date?:string|null,opponent?:string|null,fantasy_points:number|null,stats:StatLine[]} | null
-  recent_games: Array<{week:number|null,game_date?:string|null,opponent?:string|null,fantasy_points:number|null,stats:StatLine[]}>
+  recent_games: Array<{week:number|null,game_date?:string|null,opponent?:string|null,fantasy_points:number|null,projected_points?:number|null,fantasy_points_source?:string|null,stats:StatLine[]}>
   source:string
   note?:string
 }

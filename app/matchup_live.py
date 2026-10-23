@@ -282,6 +282,8 @@ def player_profile(league, player_id, week):
             if not breakdown and _number(row.get("points")) in (None, 0):
                 continue
             history.append({"week": w, "fantasy_points": _number(row.get("points")),
+                            "fantasy_points_source": "ESPN Fantasy league score",
+                            "projected_points": _number(row.get("projected_points")),
                             "stats": _clean_breakdown(breakdown)})
     history.sort(key=lambda x: x["week"], reverse=True)
     season_totals = defaultdict(float)
@@ -307,21 +309,48 @@ def player_profile(league, player_id, week):
     # columns prevent accidental substitution of ESPN career statistics.
     # It is a best-effort source, not a prerequisite for opening a profile.
     try:
+        from league_settings import get_league_scoring_context, reception_points_or_default
         from season_nfl_stats import current_season_player_stats
-        verified = current_season_player_stats(getattr(player, "name", ""),
-            getattr(player, "position", None), getattr(player, "proTeam", None), year, week)
+        reception_points = reception_points_or_default(get_league_scoring_context(league), default=1.0)
+        verified = current_season_player_stats(
+            getattr(player, "name", ""), getattr(player, "position", None),
+            getattr(player, "proTeam", None), year, week, reception_points=reception_points)
     except Exception:
-        verified = {"season_stats": [], "weeks_covered": [], "stats_source": "unavailable"}
-    if verified["season_stats"]:
+        verified = {"season_stats": [], "weeks_covered": [], "recent_games": [], "stats_source": "unavailable"}
+    if verified.get("season_stats"):
         full_stats = verified["season_stats"]
         full_source = verified["stats_source"]
         verified_weeks = verified["weeks_covered"]
     if full_stats:
         season_stats = full_stats
-    if len(history) < 2 and public["recent_games"]:
-        # Public NFL game logs have real NFL stat lines but not ESPN fantasy
-        # points. Never invent fantasy scores from generic NFL stats.
-        history = [{**g, "week": None} for g in public["recent_games"]]
+
+    # ESPN Fantasy often exposes only one week of per-player history. Merge
+    # nflverse's explicit (season, week) records without overwriting known ESPN
+    # league-scored points. Never replace a scored ESPN week with a scoreless
+    # public NFL game log just because fewer than two weeks were returned.
+    nflverse_games = verified.get("recent_games") or []
+    if nflverse_games:
+        by_week = {g["week"]: dict(g) for g in nflverse_games if isinstance(g.get("week"), int)}
+        for espn_game in history:
+            w = espn_game.get("week")
+            if w in by_week:
+                merged = by_week[w]
+                # ESPN is authoritative for league-specific fantasy scoring.
+                if espn_game.get("fantasy_points") is not None:
+                    merged["fantasy_points"] = espn_game["fantasy_points"]
+                    merged["fantasy_points_source"] = "ESPN Fantasy league score"
+                if espn_game.get("stats") and not merged.get("stats"):
+                    merged["stats"] = espn_game["stats"]
+                if espn_game.get("projected_points") is not None:
+                    merged["projected_points"] = espn_game["projected_points"]
+            else:
+                by_week[w] = espn_game
+        history = sorted(by_week.values(), key=lambda g: int(g.get("week") or 0), reverse=True)
+    elif len(history) < 2 and public.get("recent_games"):
+        # Display public NFL logs only when no scored weekly evidence exists.
+        # Keep their fantasy points unavailable, and label source accurately.
+        if not history:
+            history = [{**g, "week": None} for g in public["recent_games"]]
     season_points = _number(getattr(roster_player or player, "total_points", None))
     season_avg = _number(getattr(roster_player or player, "avg_points", None))
     season_games = len(history)

@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import unicodedata
+from math import isfinite
 
 
 def _normalize_name(value):
@@ -40,7 +41,7 @@ _LABELS = (
 
 
 def _empty():
-    return {"season_stats": [], "weeks_covered": [],
+    return {"season_stats": [], "weeks_covered": [], "recent_games": [],
             "stats_source": "unavailable", "verified_season": False}
 
 
@@ -53,7 +54,56 @@ def _clean_value(value):
         return 0.0
 
 
-def summarize_weekly_rows(rows, season, week, position=None):
+
+def weekly_game_log(rows, position=None, reception_points=1.0):
+    """Verified player-week stats and nflverse standard/PPR fantasy scoring.
+
+    Never pretend nflverse-derived points reproduce non-reception custom ESPN
+    bonuses. ESPN Fantasy points, if available, supersede these in the profile.
+    """
+    pos = str(position or "").upper()
+    groups = ({"passing", "rushing"} if pos == "QB" else
+              {"rushing", "receiving"} if pos == "RB" else
+              {"receiving", "rushing"} if pos in {"WR", "TE"} else
+              {"passing", "rushing", "receiving"})
+    result = []
+    for r in sorted(rows, key=lambda x: int(x["week"]), reverse=True):
+        stats = []
+        for key, label, group in _LABELS:
+            if group not in groups or key not in r:
+                continue
+            val = _clean_value(r.get(key))
+            if abs(val) > 0.0001:
+                stats.append({"key": key, "label": label, "value": round(val, 2), "category": group})
+        catches = _clean_value(r.get("receptions"))
+        points = None
+        try:
+            standard = float(r["fantasy_points"]) if r.get("fantasy_points") is not None else None
+            ppr = float(r["fantasy_points_ppr"]) if r.get("fantasy_points_ppr") is not None else None
+            # Older nflverse caches can have an all-zero placeholder in the
+            # standard column. Use the actual PPR field if the zero is clearly
+            # inconsistent with the supplied receptions and PPR points.
+            if standard is not None and ppr is not None and standard == 0 and ppr > catches + 0.01:
+                standard = None
+            if standard is not None and isfinite(standard):
+                points = standard + float(reception_points) * catches
+            elif ppr is not None and isfinite(ppr):
+                points = ppr - (1.0 - float(reception_points)) * catches
+            if points is not None and not isfinite(points):
+                points = None
+        except (TypeError, ValueError):
+            pass
+        item = {"week": int(r["week"]), "fantasy_points": round(points, 2) if points is not None else None,
+                "fantasy_points_source": "nflverse reception-adjusted fantasy scoring" if points is not None else None,
+                "stats": stats, "source": "nflverse weekly player stats"}
+        opponent = r.get("opponent") or r.get("opponent_team")
+        if opponent:
+            item["opponent"] = str(opponent)
+        result.append(item)
+    return result
+
+
+def summarize_weekly_rows(rows, season, week, position=None, reception_points=1.0):
     """Aggregate only verified season/week rows, for easy offline testing.
 
     ``week`` is an exclusive cutoff: never include future or not-yet-final
@@ -94,11 +144,12 @@ def summarize_weekly_rows(rows, season, week, position=None):
     if not result:
         return _empty()
     return {"season_stats": result, "weeks_covered": sorted(accepted),
+            "recent_games": weekly_game_log(chosen, position, reception_points),
             "stats_source": f"nflverse {int(season)} regular season (completed weeks)",
             "verified_season": True}
 
 
-def current_season_player_stats(name, position, nfl_team, season, week, *, rows=None):
+def current_season_player_stats(name, position, nfl_team, season, week, *, rows=None, reception_points=1.0):
     """Load cached nflverse weekly rows, matching player identity conservatively.
 
     ``rows`` injection supports deterministic tests. No live data source is
@@ -145,4 +196,4 @@ def current_season_player_stats(name, position, nfl_team, season, week, *, rows=
             return _empty()  # never aggregate two players with same name
         chosen_id = next(iter(chosen_ids))
         matches = [r for r in matches if str(r.get("player_id")) == chosen_id]
-    return summarize_weekly_rows(matches, season, week, position)
+    return summarize_weekly_rows(matches, season, week, position, reception_points)

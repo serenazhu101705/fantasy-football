@@ -139,7 +139,14 @@ function PlayerDrawer({ selected, onClose, week }: {selected:{id:number,name:str
         <h3>This week's projected NFL stats</h3><StatGrid stats={profile.current_week.projected_stats} empty="ESPN did not provide a projected stat breakdown." />
         <h3>Last completed game {profile.last_completed_game?.week ? `· Week ${profile.last_completed_game.week}` : profile.last_completed_game?.game_date ? `· ${new Date(profile.last_completed_game.game_date).toLocaleDateString()}` : ''}</h3>
         {profile.last_completed_game ? <><p className="detail-muted">{profile.last_completed_game.fantasy_points != null ? `${points(profile.last_completed_game.fantasy_points)} fantasy points` : 'NFL stats from ESPN game log · fantasy scoring not available for this entry'}</p><StatGrid stats={profile.last_completed_game.stats}/></> : <p className="detail-muted">No completed-game stat breakdown available.</p>}
-        <h3>Recent fantasy scores</h3><div className="recent-game-list">{profile.recent_games.length ? profile.recent_games.map(g=><span key={g.week || g.game_date}>{g.week ? `W${g.week}` : g.game_date ? new Date(g.game_date).toLocaleDateString() : 'Game'}: <strong>{g.fantasy_points != null ? `${points(g.fantasy_points)} fantasy pts` : 'NFL game log'}</strong></span>) : <p className="detail-muted">No prior games available.</p>}</div>
+        <h3>Recent performances</h3><div className="recent-game-list">{profile.recent_games.length ? profile.recent_games.map((g,i)=><details className="game-log-entry" key={`${g.week ?? g.game_date ?? i}-${i}`}>
+          <summary><span className="game-log-date">{g.week ? `Week ${g.week}` : g.game_date ? new Date(g.game_date).toLocaleDateString() : 'NFL game'}{g.opponent ? ` · vs ${g.opponent}` : ''}</span>
+            <span className={`game-log-pts ${g.fantasy_points == null?'unavailable':''}`}>{g.fantasy_points != null ? `${points(g.fantasy_points)} fantasy pts` : 'Fantasy score unavailable'}</span></summary>
+          <div className="game-log-expanded">{g.projected_points != null && <p className="detail-muted">ESPN projected: {points(g.projected_points)} pts</p>}
+            {g.fantasy_points_source && <p className="detail-muted">Points source: {g.fantasy_points_source}</p>}
+            <StatGrid stats={g.stats} empty="No verified NFL stat breakdown for this game." />
+          </div>
+        </details>) : <p className="detail-muted">No verified recent weekly performances are available.</p>}</div>
         <div className="claude-player-card"><div><span className="panel-kicker">OPTIONAL · USES CLAUDE TOKENS</span><h3>Personalized player breakdown</h3><p>A short explanation of the last game, season performance, and this week's outlook, using ESPN facts.</p></div>
           {!analysis && <button className="button-action" disabled={analyzing} onClick={()=>void generate()}>{analyzing?'Analyzing…':'Analyze with Claude'} <Sparkles size={14}/></button>}
           {analysisError && <p className="detail-error">{analysisError}</p>}

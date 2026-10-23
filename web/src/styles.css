@@ -113,3 +113,20 @@
 .pagination-bar .pagination-page.is-current{background:#b7f779;border-color:#b7f779;color:#192915}
 .pagination-bar .pagination-direction:disabled{opacity:.35;cursor:not-allowed}
 @media(max-width:750px){.pagination-bar{margin:10px 12px 16px;padding:12px}.pagination-navigation{width:100%;justify-content:space-between}.pagination-pages{justify-content:center}.pagination-bar .pagination-direction{padding:8px}.pagination-bar .pagination-direction span{display:none}}
+
+/* v7.20: expandable, legible verified weekly fantasy game logs. */
+.recent-game-list { display: grid; gap: 0.65rem; }
+.recent-game-list .game-log-entry {
+  border: 1px solid rgba(156,180,203,.20); border-radius: 12px;
+  background: rgba(34,51,67,.55); padding: .8rem 1rem; min-width: 0;
+}
+.recent-game-list .game-log-entry summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center;
+  justify-content: space-between; gap: 1rem; font-size: .9rem;
+}
+.recent-game-list .game-log-entry summary::-webkit-details-marker { display: none; }
+.game-log-date { color: #aabacb; }
+.game-log-pts { color: #b6fa75; font-weight: 700; text-align: right; }
+.game-log-pts.unavailable { color: #aabacb; font-weight: 500; }
+.game-log-expanded { margin-top: .8rem; border-top: 1px solid rgba(156,180,203,.18); padding-top: .75rem; }
+.game-log-expanded .stat-detail-grid { margin-top: .5rem; }
