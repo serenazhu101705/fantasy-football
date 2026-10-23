@@ -107,6 +107,25 @@ class EngineHost:
         try:
             engine.CHAT_HISTORY = state.history
             engine.DECISION_CONTEXT = state.decision
+            # API-layer safety net: bypass Claude entirely for NFL-wide numeric
+            # leaderboards. This is independent of the general conversation
+            # router, which previously allowed a stats question to use RSS news.
+            from nfl_chat_guard import maybe_answer_nfl_leaderboard
+            direct = maybe_answer_nfl_leaderboard(message, season=getattr(engine, "SEASON", 2026))
+            if direct is not None:
+                print(f"[NFL_CHAT_GUARD] stat={direct['leaderboard_stat']} "
+                      f"status={direct['leaderboard_status']} api_calls=0")
+                state.history.append({"role": "user", "content": message})
+                state.history.append({"role": "assistant", "content": direct["answer"]})
+                # Do not carry unrelated A-versus-B and waiver context into a
+                # new league-wide question; keep each session independent.
+                state.decision.update({"players": [], "horizon": None,
+                                       "acquisition": False, "position": None,
+                                       "open_spot": False, "waiver_drop_target": None,
+                                       "requested_add_count": 1})
+                engine.CHAT_HISTORY = state.history
+                engine.DECISION_CONTEXT = state.decision
+                return direct
             result = engine.ask_claude(message, return_details=True)
             state.history = engine.CHAT_HISTORY
             state.decision = engine.DECISION_CONTEXT
@@ -178,8 +197,11 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
 
     @api.get("/api/health")
     def health():
+        # Makes an old still-running uvicorn process immediately detectable.
+        from nfl_chat_guard import GUARD_VERSION
         return {"status": "ok", "ready": bool(host.engine and host.engine.APP_CONTEXT is not None),
-                "server_time": datetime.now(timezone.utc).isoformat()}
+                "server_time": datetime.now(timezone.utc).isoformat(),
+                "nfl_leaderboard_guard": GUARD_VERSION}
 
     @api.post("/api/sessions", status_code=201)
     def create_session():
@@ -256,6 +278,15 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
                 raise HTTPException(status_code=422, detail=result.get("error", "Invalid position"))
             return result
 
+    @api.get("/api/waivers/recommended")
+    def recommended_waivers(position: str = Query(default="ALL"),
+                            limit: int = Query(default=5, ge=1, le=12)):
+        from waiver_explanations import personalized_waivers
+        with host.lock:
+            context = host.ensure_ready().APP_CONTEXT or {}
+            return _league_feature(lambda: personalized_waivers(
+                context, position=position, limit=limit))
+
     @api.get("/api/waivers/browse")
     def browse_waivers(position: str = Query(default="ALL"),
                       page: int = Query(default=1, ge=1),
@@ -317,8 +348,18 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         from nfl_leaderboards import METRICS, get_nfl_leaderboard
         if stat not in METRICS:
             raise HTTPException(status_code=422, detail="Unsupported NFL statistic.")
-        result = get_nfl_leaderboard(f"top {limit} NFL {stat.replace('_', ' ')}", season=2026)
-        return result
+        # Retain the legacy diagnostic endpoint's nflverse-only contract.
+        return get_nfl_leaderboard(f"top {limit} NFL {stat.replace('_', ' ')}", season=2026)
+
+    @api.get("/api/nfl/verified-leaders")
+    def get_verified_nfl_leaders(stat: str = Query(default="passing_yards"),
+                                 limit: int = Query(default=5, ge=1, le=20)):
+        """Use the same nflverse -> ESPN fallback as chat, without Claude/news."""
+        from nfl_leaderboards import METRICS
+        from nfl_source_lookup import verified_leaderboard
+        if stat not in METRICS:
+            raise HTTPException(status_code=422, detail="Unsupported NFL statistic.")
+        return verified_leaderboard(f"top {limit} NFL {stat.replace('_', ' ')}", season=2026)
 
     @api.get("/api/news")
     def get_news(limit: int = Query(default=24, ge=1, le=50)):

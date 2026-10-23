@@ -28,12 +28,37 @@ export interface LeagueData {
 export interface WaiverBrowserData {
   requested_position: string
   candidate_pool: Player[]
+  candidate_explanations?: WaiverImpact[]
   page: number
   page_size: number
   total: number
   total_pages: number
   scope: string
   loaded_pool_size: number
+  note: string
+}
+
+export interface WaiverImpact {
+  player: Player
+  category: string
+  label: string
+  actionable: boolean
+  suggested_drop: {espn_id?: number | null, name:string, position?:string} | null
+  fit: string
+  roster_comparison: string
+  this_week: string
+  rest_of_season: string
+  decision: string
+  evidence_note: string
+  projection_sources: Record<string,number>
+}
+
+export interface RecommendedWaiversData {
+  requested_position: string
+  recommendations: WaiverImpact[]
+  actionable_count: number
+  loaded_candidates: number
+  week?: number | null
   note: string
 }
 

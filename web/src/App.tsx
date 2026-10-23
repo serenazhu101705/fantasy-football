@@ -4,7 +4,7 @@ import { Activity, ArrowRight, Bot, Check, ChevronDown, ChevronLeft, ChevronRigh
 import { ApiError, post, request } from './api'
 import { orderRoster } from './rosterLayout'
 import { PlayerHeadshot } from './PlayerHeadshot'
-import type { CoachReply, LeagueData, LineupData, Player, WaiverBrowserData, MatchupStrategy,
+import type { CoachReply, LeagueData, LineupData, Player, WaiverBrowserData, WaiverImpact, RecommendedWaiversData, MatchupStrategy,
   LineupPreview, ApplyLineupResponse, StandingsData, FaabData, ScheduleData, TransactionData, TeamRosterData, ClaimsData, LeagueMatchupsData, NewsBrowseData, RosterNewsData, MatchupPlayer, PlayerProfile, PlayerAnalysis, StatLine, WeeklyRecap, WeeklyRecapStatus } from './api' 
 
 type Tab = 'overview' | 'roster' | 'waivers' | 'lineup' | 'matchup' | 'league' | 'feed' | 'settings'
@@ -16,7 +16,7 @@ const SUGGESTIONS = [
   'Best WR waiver pickup for ROS',
   'What waiver moves would improve my odds this week?',
 ]
-const POSITION_FILTERS = ['ALL', 'QB', 'RB', 'WR', 'TE']
+const POSITION_FILTERS = ['ALL', 'QB', 'RB', 'WR', 'TE', 'K', 'D/ST']
 
 function points(value?: number | null) { return typeof value === 'number' ? value.toFixed(1) : '—' }
 function moneyTokens(reply?: CoachReply) { return reply ? `${(reply.input_tokens + reply.output_tokens).toLocaleString()} tokens · ${reply.api_calls} call${reply.api_calls === 1 ? '' : 's'}` : '' }
@@ -37,6 +37,30 @@ function PlayerRow({ player, showSlot = false, onOpen }: { player: Player, showS
     {status && status !== 'ACTIVE' && <span className="injury">{status}</span>}
     <div className="projection"><strong>{points(player.lineup_projection ?? player.espn_projection ?? player.fantasypros_projection)}</strong><span className="subtext">{player.lineup_projection_sources && player.lineup_projection_sources.length > 1 ? 'avg proj.' : 'proj.'}</span></div>
   </div>
+}
+
+function WaiverImpactCard({ impact, onOpen, compact = false }: {
+  impact: WaiverImpact, onOpen: (id:number,name:string)=>void, compact?:boolean
+}) {
+  const player = impact.player
+  return <article className={`waiver-impact ${compact ? 'waiver-impact-compact' : ''}`}>
+    {!compact && <div className="waiver-impact-head">
+      <PlayerHeadshot id={player.espn_id} name={player.name}/>
+      <div className="waiver-impact-title">
+        <button type="button" className="player-link player-name" disabled={player.espn_id == null}
+          onClick={()=>{if(player.espn_id != null) onOpen(player.espn_id,player.name)}}>{player.name}</button>
+        <span className="subtext">{player.position || '?'} · {player.team || 'NFL'}</span>
+      </div>
+      <span className={`waiver-impact-status ${impact.actionable ? 'is-actionable' : ''}`}>{impact.label}</span>
+    </div>}
+    {compact && <span className={`waiver-impact-status ${impact.actionable ? 'is-actionable' : ''}`}>{impact.label}</span>}
+    <p className="waiver-fit">{impact.fit}</p>
+    <p className="waiver-roster-comparison">{impact.roster_comparison}</p>
+    {compact ? <details className="waiver-more"><summary>Full team-fit analysis</summary>
+      <div className="waiver-evidence"><p><strong>This week:</strong> {impact.this_week}</p><p><strong>Rest of season:</strong> {impact.rest_of_season}</p><p><strong>Roster decision:</strong> {impact.decision}</p></div>
+    </details> : <div className="waiver-evidence"><p><strong>This week:</strong> {impact.this_week}</p><p><strong>Rest of season:</strong> {impact.rest_of_season}</p><p><strong>Roster decision:</strong> {impact.decision}</p></div>}
+    {impact.suggested_drop && <div className="waiver-proposed-drop">Possible move: add <strong>{player.name}</strong> · drop <strong>{impact.suggested_drop.name}</strong></div>}
+  </article>
 }
 
 // All team roster views use this same ESPN-style positional layout and
@@ -180,6 +204,8 @@ export default function App() {
   const [emailError,setEmailError] = useState('')
 
   const [waivers, setWaivers] = useState<WaiverBrowserData | null>(null)
+  const [recommendations, setRecommendations] = useState<RecommendedWaiversData | null>(null)
+  const [recommendationsError, setRecommendationsError] = useState('')
   const [waiverPage, setWaiverPage] = useState(1)
   const [position, setPosition] = useState('ALL')
   const [strategy, setStrategy] = useState<MatchupStrategy | null>(null)
@@ -386,6 +412,16 @@ export default function App() {
       .catch(err => { if (!cancelled) setError(err instanceof Error ? err.message : 'Waiver data unavailable') })
     return () => { cancelled = true }
   }, [position, waiverPage, league])
+  useEffect(() => {
+    if (!league) return
+    let cancelled = false
+    setRecommendations(null)
+    setRecommendationsError('')
+    request<RecommendedWaiversData>(`/api/waivers/recommended?position=${encodeURIComponent(position)}&limit=5`)
+      .then(data => { if (!cancelled) setRecommendations(data) })
+      .catch(err => { if (!cancelled) setRecommendationsError(err instanceof Error ? err.message : 'Waiver analysis unavailable') })
+    return () => { cancelled = true }
+  }, [position, league])
   useEffect(() => { chatBottom.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, sending])
 
   async function send(event?: FormEvent, suggested?: string) {
@@ -476,7 +512,7 @@ export default function App() {
         <div className="top-actions"><span className={`online-dot ${error ? 'offline' : ''}`}/><span className="connection">{error ? 'Check connection' : league ? 'ESPN connected' : 'Connecting to ESPN'}</span><button className="refresh-button" onClick={refresh} disabled={refreshing || sending} title="Reload ESPN fantasy data"><RefreshCw size={16} className={refreshing ? 'rotating' : ''}/><span>Refresh</span></button></div>
       </header>
       <div className="content">
-        <section className="page-intro"><div className="eyebrow"><span className="eyebrow-line"/> DECISIONS, NOT GUESSWORK</div><div className="intro-row"><div><h1>{tab === 'overview' ? 'Your fantasy command center.' : tab === 'roster' ? 'Your roster.' : tab === 'waivers' ? 'The waiver wire.' : tab === 'matchup' ? 'Your path to victory.' : tab === 'league' ? 'Your entire league.' : tab === 'feed' ? 'The fantasy news feed.' : tab === 'settings' ? 'Email & automation.' : 'Your optimal lineup.'}</h1><p>{tab === 'overview' ? 'Make sharper start/sit calls, uncover waiver value, and know exactly where your team stands.' : tab === 'roster' ? 'Every player, role, and projection in one place.' : tab === 'waivers' ? 'Explore the actual available player pool before making a move.' : tab === 'matchup' ? 'Your ESPN matchup, projection gap, and potential lineup gains.' : tab === 'league' ? 'Records, FAAB, schedules, league moves, and opponent rosters.' : tab === 'feed' ? 'Fresh NFL headlines and fantasy analysis from ESPN and RotoWire.' : tab === 'settings' ? 'Confirm newsletter preferences and configure opt-in lineup automation.' : 'A deterministic starting point—not a substitute for your judgment.'}</p></div><div className="week-chip"><Activity size={16}/><span>WEEK {league?.week || '—'}</span><span className="chip-divider"/>{league?.scoring?.scoring || '—'}</div></div></section>
+        <section className="page-intro"><div className="eyebrow"><span className="eyebrow-line"/> DECISIONS, NOT GUESSWORK</div><div className="intro-row"><div><h1>{tab === 'overview' ? 'Your fantasy command center.' : tab === 'roster' ? 'Your roster.' : tab === 'waivers' ? 'The waiver wire.' : tab === 'matchup' ? 'Your path to victory.' : tab === 'league' ? 'Your entire league.' : tab === 'feed' ? 'The fantasy news feed.' : tab === 'settings' ? 'Email & automation.' : 'Your optimal lineup.'}</h1><p>{tab === 'overview' ? 'Make sharper start/sit calls, uncover waiver value, and know exactly where your team stands.' : tab === 'roster' ? 'Every player, role, and projection in one place.' : tab === 'waivers' ? 'See which free agents actually improve your roster, with evidence for every candidate.' : tab === 'matchup' ? 'Your ESPN matchup, projection gap, and potential lineup gains.' : tab === 'league' ? 'Records, FAAB, schedules, league moves, and opponent rosters.' : tab === 'feed' ? 'Fresh NFL headlines and fantasy analysis from ESPN and RotoWire.' : tab === 'settings' ? 'Confirm newsletter preferences and configure opt-in lineup automation.' : 'A deterministic starting point—not a substitute for your judgment.'}</p></div><div className="week-chip"><Activity size={16}/><span>WEEK {league?.week || '—'}</span><span className="chip-divider"/>{league?.scoring?.scoring || '—'}</div></div></section>
 
         {error && <div className="banner-error"><CircleAlert size={18}/><span>{error}</span><button onClick={()=>void loadDashboard()}>Retry</button></div>}
         {loading && <div className="loading-line"><RefreshCw size={15} className="rotating"/> Loading your league data…</div>}
@@ -503,7 +539,27 @@ export default function App() {
 
         {tab==='roster' && <RosterColumns players={roster} onOpen={openPlayer}/>}
 
-        {tab==='waivers' && <section className="panel full-panel"><div className="panel-head"><div><span className="panel-kicker">ESPN FREE AGENT POOL</span><h2>Players available now</h2></div><div className="filter-bar">{POSITION_FILTERS.map(pos=><button key={pos} onClick={()=>{setPosition(pos);setWaiverPage(1)}} className={position===pos ? 'selected' : ''}>{pos}</button>)}</div></div><p className="panel-description">Browse 10 players at a time from the expanded ESPN free-agent pool, not just the five-player Claude shortlist. Select a player to open their profile. No Claude calls are needed.</p><div className="player-list">{(waivers?.candidate_pool || []).map((p,i)=><PlayerRow key={`${p.espn_id||p.name}-${i}`} player={p} onOpen={openPlayer}/>)}{!waivers && <div className="empty">Loading available players…</div>}{waivers && !waivers.candidate_pool.length && <div className="empty">No more players loaded for this filter.</div>}</div>{waivers && <><PageControls page={waivers.page} totalPages={waivers.total_pages} total={waivers.total} label="Waiver" onChange={setWaiverPage}/><p className="panel-description">{waivers.note}</p></>}</section>}
+        {tab==='waivers' && <>
+          <section className="panel full-panel" aria-label="Personalized waiver recommendations">
+            <div className="panel-head"><div><span className="panel-kicker">ROSTER-AWARE PICKS · ESPN + MODEL</span><h2>Best pickups for your team</h2></div><span className="count-pill">{recommendations?.actionable_count ?? '—'} evaluated adds</span></div>
+            <p className="panel-description">Each player is compared with your current roster. Confirmed add/drop upgrades appear first; other prospects are marked as watchlist only. Reasons use loaded provider data, not invented projections.</p>
+            {recommendationsError && <div className="waiver-analysis-error">{recommendationsError}</div>}
+            {!recommendations && !recommendationsError && <div className="empty">Evaluating current roster needs…</div>}
+            {recommendations?.recommendations.length === 0 && <div className="empty">No available shortlisted players in this position.</div>}
+            <div className="waiver-impact-grid">{(recommendations?.recommendations || []).map(impact =>
+              <WaiverImpactCard key={impact.player.espn_id ?? impact.player.name} impact={impact} onOpen={openPlayer}/>)}
+            </div>
+            {recommendations && <p className="panel-description">{recommendations.note}</p>}
+          </section>
+          <section className="panel full-panel"><div className="panel-head"><div><span className="panel-kicker">ESPN FREE AGENT POOL</span><h2>Browse all available players</h2></div><div className="filter-bar">{POSITION_FILTERS.map(pos=><button key={pos} onClick={()=>{setPosition(pos);setWaiverPage(1)}} className={position===pos ? 'selected' : ''}>{pos}</button>)}</div></div>
+            <p className="panel-description">Browse 10 players at a time from the expanded ESPN pool. Every row includes a team-fit explanation, but browse order is a waiver prescreen—not a verified add/drop ranking.</p>
+            <div className="waiver-browse-list">{(waivers?.candidate_pool || []).map((p,i)=><div key={`${p.espn_id||p.name}-${i}`} className="waiver-browse-entry">
+              <PlayerRow player={p} onOpen={openPlayer}/>
+              {waivers?.candidate_explanations?.[i] && <div className="waiver-browse-explanation"><WaiverImpactCard impact={waivers.candidate_explanations[i]} onOpen={openPlayer} compact/></div>}
+            </div>)}{!waivers && <div className="empty">Loading available players…</div>}{waivers && !waivers.candidate_pool.length && <div className="empty">No more players loaded for this filter.</div>}</div>
+            {waivers && <><PageControls page={waivers.page} totalPages={waivers.total_pages} total={waivers.total} label="Waiver" onChange={setWaiverPage}/><p className="panel-description">{waivers.note}</p></>}
+          </section>
+        </>}
 
         {tab==='lineup' && <section className="panel full-panel lineup-action-panel">
           <div className="panel-head"><div><span className="panel-kicker">ESPN ROSTER CONTROL</span><h2>Apply optimal lineup</h2></div><button className="button-action" disabled={lineupActionLoading} onClick={()=>void loadLineupPreview()}>{lineupActionLoading?'Checking ESPN…':'Preview lineup changes'} <ArrowRight size={15}/></button></div>

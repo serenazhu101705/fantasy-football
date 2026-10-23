@@ -105,9 +105,12 @@ def waiver_browser(context, *, position="ALL", page=1, page_size=10):
         "on_bye_week": p.get("on_bye_week") or p.get("espn_on_bye"),
         "percent_owned": p.get("percent_owned"),
     } for p in selected]
+    from waiver_explanations import browser_explanations
+    analysis = browser_explanations(context, selected)
     return {
         "requested_position": requested,
         "candidate_pool": pool,
+        "candidate_explanations": analysis,
         "page": page,
         "page_size": page_size,
         "total": total,

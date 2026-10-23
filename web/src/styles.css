@@ -158,3 +158,32 @@
 .drawer-player-label{min-width:0}
 .drawer-player-label h2{overflow-wrap:anywhere}
 @media(max-width:450px){.player-row{gap:7px}.player-headshot-sm{width:33px;height:33px}.drawer-player-identity{gap:10px}.player-headshot-lg{width:66px;height:66px}.drawer-header h2{font-size:20px}}
+
+/* v7.27: transparent, roster-aware waiver explanations. */
+.waiver-impact-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:13px;padding:0 22px 20px}
+.waiver-impact{border:1px solid #34495b;background:#1a2935;border-radius:12px;padding:16px;min-width:0}
+.waiver-impact-head{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
+.waiver-impact-title{display:flex;flex:1;flex-direction:column;gap:5px;min-width:100px}
+.waiver-impact-title .player-name{white-space:normal;text-align:left}
+.waiver-impact-status{display:inline-flex;align-items:center;width:fit-content;border-radius:7px;border:1px solid #4b5a64;color:#bcc9d5;background:#293642;padding:6px 8px;font-size:10px;font-weight:800}
+.waiver-impact-status.is-actionable{color:#c7f9a0;border-color:#628c51;background:#263e2a}
+.waiver-fit{color:#e0eddf;font-size:12px;line-height:1.6;margin:15px 0 12px}
+.waiver-evidence{display:grid;gap:10px;border-top:1px solid #354555;padding-top:12px}
+.waiver-evidence p{font-size:11px;line-height:1.65;color:#b0bfcb;margin:0}
+.waiver-evidence strong{color:#dceacb}
+.waiver-proposed-drop{margin-top:12px;padding:10px;border-radius:7px;background:#24372f;border:1px solid #466246;color:#c5eaa8;font-size:11px;line-height:1.5}
+.waiver-browse-list{margin:0 22px 12px;border:1px solid #2d4150;border-radius:11px;overflow:hidden}
+.waiver-browse-entry{border-bottom:1px solid #2d4150}
+.waiver-browse-entry:last-child{border-bottom:0}
+.waiver-browse-entry .player-row{border-bottom:none}
+.waiver-browse-explanation{padding:0 15px 13px 70px}
+.waiver-impact-compact{background:#1c2a35;border:1px solid #314555;padding:11px 14px}
+.waiver-impact-compact .waiver-fit{margin:9px 0;color:#b4d8b0}
+.waiver-impact-compact .waiver-impact-status{font-size:9px;padding:4px 7px}
+.waiver-more{margin-top:9px}
+.waiver-more summary{font-size:11px;cursor:pointer;color:#c4f99b;font-weight:700}
+.waiver-more .waiver-evidence{margin-top:10px}
+.waiver-analysis-error{margin:0 22px 16px;padding:12px 14px;border:1px solid #91525a;background:#3d282d;border-radius:7px;color:#ffb8c1;font-size:12px}
+@media(max-width:650px){.waiver-impact-grid{grid-template-columns:1fr;padding:0 12px 18px}.waiver-browse-list{margin:0 12px 12px}.waiver-browse-explanation{padding:0 10px 10px 10px}}
+
+.waiver-roster-comparison{font-size:11px;color:#b7d8ef;line-height:1.65;margin:0 0 12px}
