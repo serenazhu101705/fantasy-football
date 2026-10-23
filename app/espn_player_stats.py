@@ -53,7 +53,9 @@ def _val(value):
 
 
 def _stat_label(code, category, glossary):
-    name = (glossary.get(code) or _LABELS.get(code) or code).strip()
+    # Raw ESPN glossary labels sometimes contain the category already (e.g.
+    # "Receiving Yards"). Prefer neutral base labels to avoid duplicates.
+    name = (_LABELS.get(code) or glossary.get(code) or code).strip()
     context = category.lower()
     if code == "ATT":
         return "Pass attempts" if "pass" in context else "Carries" if "rush" in context else "Attempts"
@@ -63,9 +65,40 @@ def _stat_label(code, category, glossary):
     return name
 
 
-def parse_season_stats(data):
-    """ESPN categories[].labels/totals are parallel arrays, not raw fantasy IDs."""
+def _season_is_explicit(data, season):
+    """Refuse ESPN career aggregates unless the response identifies this season.
+
+    ESPN sometimes ignores season query parameters and returns career totals.
+    The request URL alone is not proof of the returned split.
+    """
     if not isinstance(data, dict):
+        return False
+    for item in (data.get("season"), data.get("year"), data.get("seasonYear")):
+        if isinstance(item, dict):
+            item = item.get("year") or item.get("id")
+        if str(item) == str(season):
+            return True
+    for flt in data.get("filters") or []:
+        if not isinstance(flt, dict):
+            continue
+        key = str(flt.get("name") or flt.get("id") or "").lower()
+        if "season" not in key and "year" not in key:
+            continue
+        for choice in flt.get("options") or []:
+            if not isinstance(choice, dict) or not choice.get("selected"):
+                continue
+            if str(choice.get("value") or choice.get("id") or choice.get("year")) == str(season):
+                return True
+    return False
+
+
+def parse_season_stats(data, season=None):
+    """Parse season-only data, never an unverified ESPN career aggregate.
+
+    Calling without a season is useful for testing the parser in isolation.
+    Production code ALWAYS passes season to enforce source provenance.
+    """
+    if not isinstance(data, dict) or (season is not None and not _season_is_explicit(data, season)):
         return []
     glossary = {str(v.get("abbreviation") or "").upper(): str(v.get("displayName") or "")
                 for v in data.get("glossary", []) if isinstance(v, dict)}
@@ -83,6 +116,8 @@ def parse_season_stats(data):
                 continue
             if len(rows) >= 36:
                 break
+            if season is not None and abbreviation == "GP" and number > 18:
+                return []  # definitive indication of career/cross-season totals
             if abbreviation in {"GP", "GS"} and any(r["key"].endswith(":GP") for r in rows):
                 continue
             key = f"{name.lower()}:{abbreviation}"
@@ -91,7 +126,7 @@ def parse_season_stats(data):
     return rows
 
 
-def parse_gamelog(data):
+def parse_gamelog(data, season=None):
     if not isinstance(data, dict):
         return []
     events = data.get("events") or {}
@@ -111,6 +146,11 @@ def parse_gamelog(data):
                 if not event_id:
                     continue
                 event = events.get(event_id, {})
+                # ESPN occasionally returns career game logs despite a season
+                # query; only retain events whose dates match the target year.
+                when = str(event.get("gameDate") or event.get("date") or "")
+                if season is not None and not when.startswith(str(season)):
+                    continue
                 # ESPN labels might be a flat list or category-local labels.
                 stats = []
                 for name, amount in zip(labels, row.get("stats") or []):
@@ -149,8 +189,8 @@ def public_player_data(player_id, season, fetcher=None):
     base = f"{BASE}/{player_id}"
     stats = []
     games = []
-    for suffix, parse in ((f"stats?season={int(season)}&seasontype=2", parse_season_stats),
-                          (f"gamelog?season={int(season)}", parse_gamelog)):
+    for suffix, parse in ((f"stats?season={int(season)}&seasontype=2", lambda data: parse_season_stats(data, season=int(season))),
+                          (f"gamelog?season={int(season)}", lambda data: parse_gamelog(data, season=int(season)))):
         try:
             result = parse(fn(f"{base}/{suffix}"))
         except Exception:

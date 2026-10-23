@@ -301,6 +301,21 @@ def player_profile(league, player_id, week):
     year = int(getattr(league, "year", 0) or getattr(league, "season", 0) or 2026)
     public = public_player_data(player_id, year)
     full_stats = public["season_stats"]
+    full_source = public["stats_source"] if full_stats else "unavailable"
+    verified_weeks = []
+    # NFLverse is already used by the existing coach; its explicit season/week
+    # columns prevent accidental substitution of ESPN career statistics.
+    # It is a best-effort source, not a prerequisite for opening a profile.
+    try:
+        from season_nfl_stats import current_season_player_stats
+        verified = current_season_player_stats(getattr(player, "name", ""),
+            getattr(player, "position", None), getattr(player, "proTeam", None), year, week)
+    except Exception:
+        verified = {"season_stats": [], "weeks_covered": [], "stats_source": "unavailable"}
+    if verified["season_stats"]:
+        full_stats = verified["season_stats"]
+        full_source = verified["stats_source"]
+        verified_weeks = verified["weeks_covered"]
     if full_stats:
         season_stats = full_stats
     if len(history) < 2 and public["recent_games"]:
@@ -321,8 +336,9 @@ def player_profile(league, player_id, week):
             "season_fantasy_points": season_points, "season_fantasy_ppg": season_avg,
             "season_games_in_loaded_stats": season_games,
             "available_weeks_stat_totals": season_stats,
-            "stat_coverage_weeks": stat_weeks,
-            "season_stats_source": public["stats_source"] if full_stats else ("Partial ESPN Fantasy weekly breakdowns" if stat_weeks else "unavailable"),
+            "stat_coverage_weeks": len(verified_weeks) if verified_weeks else stat_weeks,
+            "season_stats_as_of_week": max(verified_weeks) if verified_weeks else None,
+            "season_stats_source": full_source if full_stats else ("Partial ESPN Fantasy weekly breakdowns" if stat_weeks else "unavailable"),
             "season_stats_complete": bool(full_stats),
             "bio": player_public_bio(player_id),
             "current_week": {"projected_points": current_proj,

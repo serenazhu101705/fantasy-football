@@ -123,9 +123,37 @@ def _league_feature(operation):
         raise HTTPException(status_code=503, detail=f"ESPN league feature unavailable ({type(exc).__name__}).") from None
 
 
+
+
+def _include_profile_ids(rows, source_players):
+    """Attach ESPN IDs on browser payloads only, not on Claude's compact prompts.
+
+    `tool_get_roster` intentionally compacts model inputs, but the web UI
+    needs stable ESPN identifiers to open player profiles. Resolve them from
+    the raw loaded ESPN data; never guess from a non-unique surname.
+    """
+    from collections import Counter
+    import re
+
+    def key(row):
+        name = re.sub(r"[^a-z0-9]", "", str(row.get("name") or "").lower())
+        return (name, str(row.get("position") or "").upper())
+
+    raw_rows = [row for row in (source_players or []) if isinstance(row, dict)]
+    counts = Counter(key(row) for row in raw_rows if row.get("espn_id") is not None)
+    by_key = {key(row): row["espn_id"] for row in raw_rows
+              if row.get("espn_id") is not None and counts[key(row)] == 1}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("espn_id") is not None:
+            continue
+        pid = by_key.get(key(row))
+        if pid is not None:
+            row["espn_id"] = pid
+    return rows
+
 def create_app(engine_loader: Callable | None = None) -> FastAPI:
     host = EngineHost(engine_loader or (lambda: import_module("llm")))
-    api = FastAPI(title="Fantasy Coach API", version="7.15.0", docs_url="/docs")
+    api = FastAPI(title="Fantasy Coach API", version="7.16.0", docs_url="/docs")
     api.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -170,6 +198,7 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
                 opponents = nfl_opponents(league) if league is not None else {}
             except Exception:
                 opponents = {}
+            _include_profile_ids(data.get("players", []), (engine.APP_CONTEXT or {}).get("roster"))
             for player in data.get("players", []):
                 if player.get("on_bye_week"):
                     player["opponent"] = "BYE"
@@ -191,6 +220,10 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             for player in (data.get("lineup") or {}).values():
                 if isinstance(player, dict) and not player.get("opponent"):
                     player["opponent"] = "BYE" if player.get("on_bye_week") else opponents.get(str(player.get("team") or "").upper())
+            _include_profile_ids(
+                [p for p in (data.get("lineup") or {}).values() if isinstance(p, dict)],
+                (engine.APP_CONTEXT or {}).get("roster"),
+            )
             from lineup_explanations import explain_lineup
             data["explanation"] = explain_lineup(data, engine.tool_get_roster().get("players") or [])
             return data
@@ -202,6 +235,16 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             if result.get("success") is False:
                 raise HTTPException(status_code=422, detail=result.get("error", "Invalid position"))
             return result
+
+    @api.get("/api/waivers/browse")
+    def browse_waivers(position: str = Query(default="ALL"),
+                      page: int = Query(default=1, ge=1),
+                      page_size: int = Query(default=10, ge=1, le=50)):
+        from browsing import waiver_browser
+        with host.lock:
+            context = host.ensure_ready().APP_CONTEXT or {}
+            return _league_feature(lambda: waiver_browser(
+                context, position=position, page=page, page_size=page_size))
 
     # All league-intelligence reads are deterministic (no Claude calls).
     # They share the existing engine lock so a concurrent refresh is safe.
@@ -252,6 +295,21 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         # Independent of ESPN/Claude and engine lock. Cached RSS providers.
         from news_feed import news_feed
         return news_feed(limit=limit)
+
+    @api.get("/api/news/browse")
+    def browse_news(page: int = Query(default=1, ge=1),
+                    page_size: int = Query(default=10, ge=1, le=50),
+                    source: str = Query(default="ALL")):
+        # Keep the endpoint and installed news module in sync. A missing
+        # function is a deployment mismatch, not a failure of RSS providers.
+        try:
+            from news_feed import news_feed_page
+        except ImportError:
+            raise HTTPException(
+                status_code=503,
+                detail="News module is outdated: install the current app/news_feed.py and restart FastAPI.",
+            ) from None
+        return news_feed_page(page=page, page_size=page_size, source=source)
 
     @api.get("/api/news/roster")
     def get_roster_news():
@@ -313,7 +371,8 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             # Minimal operational diagnostics: no prompts, keys, headers or
             # private roster data in logs or HTTP responses.
             if os.getenv("FANTASY_DEBUG") == "1":
-                print(f"[PLAYER ANALYSIS] error={type(exc).__name__} http_status={getattr(exc, 'status_code', 'n/a')}")
+                stop = str(exc).split("stop_reason=", 1)[-1].split(")", 1)[0] if "stop_reason=" in str(exc) else "n/a"
+                print(f"[PLAYER ANALYSIS] error={type(exc).__name__} http_status={getattr(exc, 'status_code', 'n/a')} stop_reason={stop} model={model}")
             code = getattr(exc, "status_code", None)
             if code == 429:
                 detail = "Claude is rate-limited or out of credits (HTTP 429)."
@@ -321,6 +380,9 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
                 detail = "Claude API authentication failed (HTTP 401). Check server credentials."
             elif code in (400, 404):
                 detail = f"Claude rejected the player-summary model/request (HTTP {code}). Check ANTHROPIC_MODEL."
+            elif isinstance(exc, ValueError) and "no visible player analysis" in str(exc):
+                detail = "Claude returned no visible player summary. " \
+                         "Check the server's [PLAYER ANALYSIS] stop reason and model settings."
             else:
                 detail = f"Claude player analysis unavailable ({type(exc).__name__}). See backend log with FANTASY_DEBUG=1."
             raise HTTPException(status_code=502, detail=detail) from None

@@ -25,6 +25,18 @@ export interface LeagueData {
   my_team_id: number
 }
 
+export interface WaiverBrowserData {
+  requested_position: string
+  candidate_pool: Player[]
+  page: number
+  page_size: number
+  total: number
+  total_pages: number
+  scope: string
+  loaded_pool_size: number
+  note: string
+}
+
 export interface WaiverData {
   requested_position: string
   candidate_pool: Player[]
@@ -192,6 +204,14 @@ export interface RosterNewsData {
   }>
 }
 
+export interface NewsBrowseData extends NewsData {
+  page:number
+  page_size:number
+  total:number
+  total_pages:number
+  selected_source:string
+}
+
 export interface NewsData {
   status:'available' | 'unavailable'
   articles:Array<{ title:string, summary:string, url:string, source:string, published_at:string | null }>
@@ -226,6 +246,7 @@ export interface PlayerProfile {
   season_fantasy_ppg: number | null
   season_games_in_loaded_stats: number
   stat_coverage_weeks?:number
+  season_stats_as_of_week?:number|null
   season_stats_source?:string
   season_stats_complete?:boolean
   available_weeks_stat_totals?:StatLine[]

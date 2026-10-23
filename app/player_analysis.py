@@ -19,7 +19,7 @@ def _facts(profile):
     return {key: profile.get(key) for key in (
         "name", "nfl_team", "position", "injury_status", "week",
         "season_fantasy_points", "season_fantasy_ppg", "bio",
-        "season_stats_source", "season_stats_complete",
+        "season_stats_source", "season_stats_complete", "season_stats_as_of_week",
         "available_weeks_stat_totals", "stat_coverage_weeks", "current_week",
         "last_completed_game", "recent_games"
     )}
@@ -44,11 +44,18 @@ def summarize_player(profile, client, model):
         "Don't claim a game is complete unless it is labeled last_completed_game. "
         "Keep it useful for a fantasy manager.\n\nESPN facts: " + body
     )
-    response = client.messages.create(model=model, max_tokens=340,
-        messages=[{"role": "user", "content": prompt}])
+    # Sonnet 5.5 defaults to adaptive thinking. With only 340 max tokens,
+    # thought tokens can exhaust the response before any visible text arrives.
+    # A short factual summary needs no up-front thinking. Keep one paid call.
+    params = {"model": model, "max_tokens": 850,
+              "messages": [{"role": "user", "content": prompt}]}
+    if str(model).startswith("claude-sonnet-5-5"):
+        params["thinking"] = {"type": "between_tools"}
+    response = client.messages.create(**params)
     analysis = "".join(getattr(block, "text", "") for block in response.content if getattr(block, "type", "") == "text").strip()
     if not analysis:
-        raise ValueError("Claude returned no player analysis")
+        stop_reason = str(getattr(response, "stop_reason", "unknown"))
+        raise ValueError(f"Claude returned no visible player analysis (stop_reason={stop_reason}).")
     result = {"analysis": analysis, "source": "Claude summary of ESPN factual data",
               "cached": False, "input_tokens": getattr(getattr(response, "usage", None), "input_tokens", 0),
               "output_tokens": getattr(getattr(response, "usage", None), "output_tokens", 0)}

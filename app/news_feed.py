@@ -133,6 +133,23 @@ def news_feed(*, limit=24, fetcher=None, refresh=False):
     return {**payload, "articles": payload["articles"][:limit]}
 
 
+def news_feed_page(*, page=1, page_size=10, source="ALL", fetcher=None):
+    """Paginate across the entire available cached RSS set, after filtering."""
+    if not isinstance(page, int) or page < 1 or not isinstance(page_size, int) or not 1 <= page_size <= 50:
+        raise ValueError("Invalid news pagination")
+    payload = _get_feed(fetcher=fetcher)
+    sources = payload["sources"]
+    if source != "ALL" and source not in sources:
+        raise ValueError("Unknown news source")
+    pool = [item for item in payload["articles"] if source == "ALL" or item["source"] == source]
+    total = len(pool)
+    return {**payload,
+            "articles": pool[(page - 1) * page_size:page * page_size],
+            "page": page, "page_size": page_size,
+            "total": total, "total_pages": max(1, (total + page_size - 1) // page_size),
+            "selected_source": source}
+
+
 def _name_matches(name, title, summary=""):
     # A fantasy D/ST is a team, not a person, and articles use the team name.
     if re.search(r"(?:D/ST|DST|defen[sc]e)", name or "", re.I):
