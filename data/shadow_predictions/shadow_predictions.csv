@@ -1,3 +1,8 @@
 season,week,player_key,player_name,position,nfl_team,prediction_ppr,espn_projection,fantasypros_projection,weekly_ecr,trained_season,trained_through_week,model_training_rows,player_history_games_used,availability_adjusted,logged_at_utc
 2026,6,3121422,Terry McLaurin,WR,WSH,12.188,12.34,12.09,22.0,2026,5,22342,4,False,2026-10-19T20:58:28.441432+00:00
 2026,6,4047650,DK Metcalf,WR,PIT,12.397,11.58,12.62,21.0,2026,5,22342,5,False,2026-10-19T20:58:29.036481+00:00
+2026,7,2577417,Dak Prescott,QB,DAL,18.281,,,9.0,2026,6,22618,6,False,2026-10-23T18:52:09.004232+00:00
+2026,7,4362628,Ja'Marr Chase,WR,CIN,16.656,,,3.0,2026,6,22618,5,False,2026-10-23T18:57:06.439690+00:00
+2026,7,4426515,Puka Nacua,WR,LAR,20.907,,,1.0,2026,6,22618,4,False,2026-10-23T18:57:07.097267+00:00
+2026,7,4701936,Matthew Golden,WR,GB,13.451,,,9.0,2026,6,22618,6,False,2026-10-23T19:06:43.892510+00:00
+2026,7,4248528,Christian Watson,WR,GB,13.651,,,8.0,2026,6,22618,6,False,2026-10-23T19:06:44.538987+00:00

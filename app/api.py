@@ -18,9 +18,10 @@ from time import monotonic
 from typing import Callable
 from uuid import uuid4
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from fastapi.responses import HTMLResponse
 
 MAX_SESSIONS = 32
 SESSION_TTL_SECONDS = 60 * 60 * 3
@@ -31,6 +32,19 @@ class SessionState:
     history: list = field(default_factory=list)
     decision: dict = field(default_factory=dict)
     touched: float = field(default_factory=monotonic)
+
+
+class SubscriptionRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+    thursday_lineup: bool = True
+    monday_recap: bool = True
+    injury_news: bool = True
+    bye_alerts: bool = True
+    auto_swap: bool = False
+
+
+class ConfirmLineupRequest(BaseModel):
+    confirmation_token: str = Field(min_length=16, max_length=256)
 
 
 class ChatRequest(BaseModel):
@@ -153,7 +167,7 @@ def _include_profile_ids(rows, source_players):
 
 def create_app(engine_loader: Callable | None = None) -> FastAPI:
     host = EngineHost(engine_loader or (lambda: import_module("llm")))
-    api = FastAPI(title="Fantasy Coach API", version="7.16.0", docs_url="/docs")
+    api = FastAPI(title="Fantasy Coach API", version="7.21.0", docs_url="/docs")
     api.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -225,7 +239,13 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
                 (engine.APP_CONTEXT or {}).get("roster"),
             )
             from lineup_explanations import explain_lineup
-            data["explanation"] = explain_lineup(data, engine.tool_get_roster().get("players") or [])
+            # Use consistent IDs on both sides of the comparison. Model-facing
+            # compact roster records deliberately omit these fields; the browser
+            # contract cannot rely on those different serializers matching.
+            raw_roster = (engine.APP_CONTEXT or {}).get("roster")
+            comparison_roster = engine.tool_get_roster().get("players") or []
+            _include_profile_ids(comparison_roster, raw_roster)
+            data["explanation"] = explain_lineup(data, comparison_roster)
             return data
 
     @api.get("/api/waivers")
@@ -312,13 +332,13 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         return news_feed_page(page=page, page_size=page_size, source=source)
 
     @api.get("/api/news/roster")
-    def get_roster_news():
+    def get_roster_news(refresh: bool = Query(default=False)):
         # Only requested by the "My Team News" tab: no background fan-out on load.
         from news_feed import roster_news
         with host.lock:
             players = deepcopy(host.ensure_ready().tool_get_roster().get("players") or [])
         # Network/RSS fan-out must not hold the Claude/ESPN conversation lock.
-        return roster_news(players)
+        return roster_news(players, refresh=refresh)
 
     @api.get("/api/league/pending-claims")
     def get_pending_claims():
@@ -332,15 +352,27 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             league, team = _espn_context(host.ensure_ready())
             return _league_feature(lambda: matchup_strategy(league, team.team_id, week))
 
+    def _find_loaded_free_agent(engine, player_id):
+        context = engine.APP_CONTEXT or {}
+        pools = [context.get("_browser_free_agents") or [], context.get("free_agents") or [],
+                 context.get("waiver_candidates") or []]
+        for pool in pools:
+            for player in pool:
+                if str(player.get("espn_id")) == str(player_id):
+                    return player
+        return None
+
     @api.get("/api/players/{player_id}")
     def get_player_profile(player_id: int, week: int | None = Query(default=None, ge=1, le=18)):
         """Read-only ESPN profile; clicking a name never invokes Claude."""
         from matchup_live import player_profile
         with host.lock:
-            league, _ = _espn_context(host.ensure_ready())
+            engine = host.ensure_ready()
+            league, _ = _espn_context(engine)
+            free_agent = deepcopy(_find_loaded_free_agent(engine, player_id))
         # Public bio/stats network I/O must not hold the engine/chat lock.
         try:
-            return player_profile(league, player_id, week)
+            return player_profile(league, player_id, week, free_agent=free_agent)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
         except Exception as exc:
@@ -357,10 +389,11 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             engine = host.ensure_ready()
             league, _ = _espn_context(engine)
             client, model = engine.client, engine.MODEL
+            free_agent = deepcopy(_find_loaded_free_agent(engine, player_id))
         # Claude requests are independent of CLI conversation global state.
         # Do not block roster/chat/matchup requests during the network call.
         try:
-            profile = player_profile(league, player_id, week)
+            profile = player_profile(league, player_id, week, free_agent=free_agent)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from None
         except Exception as exc:
@@ -418,6 +451,92 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
             if os.getenv("FANTASY_DEBUG") == "1":
                 print(f"[WEEKLY RECAP] error={type(exc).__name__} http_status={getattr(exc, 'status_code', 'n/a')}")
             raise HTTPException(status_code=502, detail=f"Weekly recap unavailable ({type(exc).__name__}).") from None
+
+    @api.post("/api/subscriptions", status_code=202)
+    def subscribe_to_emails(body: SubscriptionRequest):
+        from email_subscriptions import subscribe
+        try:
+            return subscribe(body.email, body.model_dump(exclude={"email"}))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(status_code=503,
+                detail=f"Email service not configured or unavailable ({type(exc).__name__}).") from None
+
+    @api.get("/api/subscriptions/confirm", response_class=HTMLResponse)
+    def confirm_subscription(token: str = Query(min_length=16, max_length=512)):
+        from email_subscriptions import confirm
+        ok = confirm(token)
+        return HTMLResponse(
+          "<h2>Fantasy Coach</h2><p>" + ("Email subscription confirmed." if ok else
+          "Confirmation link invalid or expired.") + "</p>", status_code=200 if ok else 410)
+
+    @api.get("/api/subscriptions/unsubscribe", response_class=HTMLResponse)
+    def unsubscribe_confirmation(token: str = Query(min_length=16, max_length=512)):
+        # GET links are often opened by email security scanners. Do not
+        # unsubscribe until a human confirms via POST.
+        from html import escape
+        return HTMLResponse("<h2>Fantasy Coach</h2><p>Unsubscribe from fantasy emails?</p>"+
+            '<form action="/api/subscriptions/unsubscribe" method="post">'+
+            '<input type="hidden" name="token" value="'+escape(token,quote=True)+'"/>'+
+            '<button type="submit">Yes, unsubscribe</button></form>')
+
+    @api.post("/api/subscriptions/unsubscribe", response_class=HTMLResponse)
+    async def unsubscribe_email(request: Request):
+        from email_subscriptions import unsubscribe
+        from urllib.parse import parse_qs
+        # Starlette form parser would require python-multipart; urlencoded is
+        # straightforward and uses no new dependency.
+        raw = (await request.body()).decode("utf-8",errors="replace")
+        token = parse_qs(raw).get("token",[""])[0]
+        ok = unsubscribe(token)
+        return HTMLResponse("<h2>Fantasy Coach</h2><p>" +
+             ("Unsubscribed successfully." if ok else "Link is invalid or already used.") +
+             "</p>", status_code=200 if ok else 410)
+
+    def _lineup_inputs():
+        from matchup_live import nfl_game_statuses
+        engine = host.ensure_ready()
+        league, team = _espn_context(engine)
+        # Default optimizer results use a compact serializer; populate the
+        # authoritative ID mapping from the loaded ESPN roster only.
+        optimal = engine.tool_get_optimal_lineup()
+        _include_profile_ids(
+            [p for p in (optimal.get("lineup") or {}).values() if isinstance(p, dict)],
+            (engine.APP_CONTEXT or {}).get("roster"))
+        return league, team, optimal, nfl_game_statuses(league, int(league.current_week))
+
+    @api.get("/api/lineup/preview")
+    def preview_lineup():
+        from lineup_actions import create_preview
+        with host.lock:
+            try:
+                league, team, optimal, status = _lineup_inputs()
+                return create_preview(league, team, optimal, game_status=status)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @api.post("/api/lineup/apply")
+    def apply_lineup(body: ConfirmLineupRequest):
+        from lineup_actions import submit_preview
+        with host.lock:
+            try:
+                league, team, optimal, status = _lineup_inputs()
+                outcome = submit_preview(league, team, optimal, body.confirmation_token, game_status=status)
+                if outcome.get("changes"):
+                    # Re-read ESPN; no success claim if read-back disagrees.
+                    if hasattr(league, "load_roster_week"):
+                        league.load_roster_week(int(league.current_week))
+                        desired = {p["player_id"]:p["to"] for p in outcome["changes"]}
+                        from lineup_actions import _current_slot
+                        current = {int(p.playerId):_current_slot(p) for p in team.roster}
+                        outcome["verified"] = all(current.get(pid)==slot for pid,slot in desired.items())
+                    outcome["note"] = "Verified on ESPN." if outcome.get("verified") else                                      "ESPN accepted the request, but verification is pending. Check ESPN before retrying."
+                return outcome
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Lineup write/readback unavailable ({type(exc).__name__}).") from None
 
     @api.post("/api/chat")
     def chat(body: ChatRequest, x_fantasy_session: str | None = Header(default=None)):

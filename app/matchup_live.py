@@ -235,8 +235,63 @@ def _clean_breakdown(value):
     return list(unique.values())[:32]
 
 
-def player_profile(league, player_id, week):
-    """Find a rostered/player-in-matchup ESPN record, never fabricate biography."""
+def _completed_espn_fantasy_scores(league, player_id, current_week, *, get_scores=None,
+                                   known_weeks=(), max_games=5):
+    """Read actual fantasy points from completed ESPN fantasy box scores.
+
+    ESPN's loaded Player.stats dict may only contain the latest week even
+    though the authenticated league has historical weekly box-score data.
+    Look up the exact ESPN player ID (never a fuzzy name match). Historical
+    results are shared via league_intelligence's cache. No Claude or
+    FantasyPros calls. A missing response must never become a zero score.
+    """
+    from league_intelligence import _get_box_scores
+    fetch = get_scores or _get_box_scores
+    known = set(known_weeks)
+    result = []
+    # Historical weeks are final in the league's scheduling model. The
+    # current week is handled by the separate live/actual panel.
+    weeks = list(range(max(1, int(current_week) - max_games), int(current_week)))
+    for week in reversed(weeks):
+        if week in known:
+            continue
+        try:
+            boxes = fetch(league, week)
+        except Exception:
+            continue
+        found = None
+        for box in boxes:
+            for side in ("home", "away"):
+                for player in (getattr(box, f"{side}_lineup", None) or []):
+                    if str(getattr(player, "playerId", "")) != str(player_id):
+                        continue
+                    actual = _number(getattr(player, "points", None))
+                    if actual is None:
+                        continue
+                    found = {
+                        "week": week, "fantasy_points": actual,
+                        "fantasy_points_source": "ESPN Fantasy league box score",
+                        "projected_points": _number(getattr(player, "projected_points", None)),
+                        "stats": _clean_breakdown(getattr(player, "breakdown", None)),
+                        "source": "ESPN Fantasy completed-week box score",
+                    }
+                    break
+                if found:
+                    break
+            if found:
+                break
+        if found is not None:
+            result.append(found)
+    return result
+
+
+def player_profile(league, player_id, week, *, free_agent=None):
+    """Find a player by exact ESPN ID, including loaded ESPN free agents.
+
+    A player on waivers is not in any fantasy team roster or matchup; the
+    browser pool supplies their authoritative ESPN player ID and name. We
+    never guess one player's biography or fantasy points from another name.
+    """
     from league_intelligence import _get_box_scores, _week
     week = _week(league, week)
     player = None
@@ -261,6 +316,15 @@ def player_profile(league, player_id, week):
         if roster_player is not None:
             break
     player = box_player or roster_player
+    if player is None and isinstance(free_agent, dict) and str(free_agent.get("espn_id")) == str(player_id):
+        from types import SimpleNamespace
+        player = SimpleNamespace(
+            playerId=player_id, name=free_agent.get("name", "Unknown"),
+            proTeam=free_agent.get("nfl_team") or free_agent.get("team"),
+            position=free_agent.get("position"),
+            injuryStatus=free_agent.get("injury_status") or "UNKNOWN",
+            espn_projected_points=free_agent.get("espn_projected_points") if free_agent.get("espn_projected_points") is not None else free_agent.get("espn_projection"),
+            stats={}, total_points=None, avg_points=None)
     if player is None:
         raise ValueError("Player is not in the loaded league rosters or matchup.")
     # The roster Player generally carries a fuller week-by-week stat history,
@@ -324,33 +388,69 @@ def player_profile(league, player_id, week):
     if full_stats:
         season_stats = full_stats
 
-    # ESPN Fantasy often exposes only one week of per-player history. Merge
-    # nflverse's explicit (season, week) records without overwriting known ESPN
-    # league-scored points. Never replace a scored ESPN week with a scoreless
-    # public NFL game log just because fewer than two weeks were returned.
-    nflverse_games = verified.get("recent_games") or []
-    if nflverse_games:
-        by_week = {g["week"]: dict(g) for g in nflverse_games if isinstance(g.get("week"), int)}
-        for espn_game in history:
-            w = espn_game.get("week")
-            if w in by_week:
-                merged = by_week[w]
-                # ESPN is authoritative for league-specific fantasy scoring.
-                if espn_game.get("fantasy_points") is not None:
-                    merged["fantasy_points"] = espn_game["fantasy_points"]
-                    merged["fantasy_points_source"] = "ESPN Fantasy league score"
-                if espn_game.get("stats") and not merged.get("stats"):
-                    merged["stats"] = espn_game["stats"]
-                if espn_game.get("projected_points") is not None:
-                    merged["projected_points"] = espn_game["projected_points"]
-            else:
-                by_week[w] = espn_game
-        history = sorted(by_week.values(), key=lambda g: int(g.get("week") or 0), reverse=True)
-    elif len(history) < 2 and public.get("recent_games"):
-        # Display public NFL logs only when no scored weekly evidence exists.
-        # Keep their fantasy points unavailable, and label source accurately.
-        if not history:
-            history = [{**g, "week": None} for g in public["recent_games"]]
+    # Preserve official ESPN points wherever available, then fill remaining
+    # weeks from nflverse if it has verified player-week rows. A public NFL
+    # gamelog does NOT carry league fantasy scores and must never supersede
+    # either of these.
+    by_week = {g["week"]: dict(g) for g in (verified.get("recent_games") or [])
+               if isinstance(g.get("week"), int)}
+    for espn_game in history:
+        w = espn_game["week"]
+        merged = dict(by_week.get(w, {}))
+        if espn_game.get("fantasy_points") is not None:
+            merged["fantasy_points"] = espn_game["fantasy_points"]
+            merged["fantasy_points_source"] = "ESPN Fantasy league score"
+        if espn_game.get("stats") and not merged.get("stats"):
+            merged["stats"] = espn_game["stats"]
+        if espn_game.get("projected_points") is not None:
+            merged["projected_points"] = espn_game["projected_points"]
+        merged["week"] = w
+        by_week[w] = merged
+
+    # The critical fallback: fetch the exact historical player points from
+    # ESPN fantasy box scores. These are actual league-scored points, not
+    # approximations and not an NFL-only gamelog with an empty score field.
+    scored_weeks = {w for w, row in by_week.items() if row.get("fantasy_points") is not None}
+    desired = min(5, max(0, week - 1))
+    if len([w for w in scored_weeks if week - 5 <= w < week]) < desired:
+        for espn_game in _completed_espn_fantasy_scores(
+                league, player_id, week, known_weeks=scored_weeks):
+            w = espn_game["week"]
+            merged = dict(by_week.get(w, {}))
+            merged.update({k: v for k, v in espn_game.items() if v is not None and
+                           (k not in {"stats"} or v or not merged.get("stats"))})
+            by_week[w] = merged
+
+    # The league can still report Week 7 as current after Monday's final.
+    # Include this week in the *completed* game log only when the player's
+    # actual NFL game is explicitly FINAL, never merely because points > 0.
+    try:
+        team_status = (nfl_game_statuses(league, week).get("games") or {}).get(
+            _team(getattr(player, "proTeam", None)), {})
+    except Exception:
+        team_status = {}
+    if team_status.get("state") == "FINAL":
+        current_score = (_number(getattr(box_player, "points", None)) if box_player is not None
+                         else _number(current.get("points")))
+        if current_score is not None:
+            completed = dict(by_week.get(week, {}))
+            completed.update({"week": week, "fantasy_points": current_score,
+                              "fantasy_points_source": "ESPN Fantasy final-week score",
+                              "projected_points": (_number(getattr(box_player, "projected_points", None))
+                                                   if box_player is not None else _number(current.get("projected_points"))),
+                              "opponent": team_status.get("opponent"),
+                              "source": "ESPN Fantasy completed game"})
+            if not completed.get("stats"):
+                completed["stats"] = _clean_breakdown(
+                    getattr(box_player, "breakdown", None) if box_player is not None
+                    else current.get("breakdown"))
+            by_week[week] = completed
+
+    history = sorted(by_week.values(), key=lambda g: g.get("week", 0), reverse=True)
+    if not history and public.get("recent_games"):
+        # Truly unsupported player: retain dated NFL gamelogs, but clearly
+        # label missing fantasy scores instead of fabricating them.
+        history = [{**g, "week": None} for g in public["recent_games"]]
     season_points = _number(getattr(roster_player or player, "total_points", None))
     season_avg = _number(getattr(roster_player or player, "avg_points", None))
     season_games = len(history)
@@ -358,7 +458,8 @@ def player_profile(league, player_id, week):
     current_points = (_number(getattr(box_player, "points", None)) if box_player is not None
                       else _number(current.get("points")))
     current_proj = (_number(getattr(box_player, "projected_points", None)) if box_player is not None
-                    else _number(current.get("projected_points")))
+                    else (_number(current.get("projected_points")) if current.get("projected_points") is not None
+                          else _number(getattr(player, "espn_projected_points", None))))
     return {"espn_id": player_id, "name": getattr(player, "name", "Unknown"),
             "nfl_team": getattr(player, "proTeam", None), "position": getattr(player, "position", None),
             "injury_status": getattr(player, "injuryStatus", None), "week": week,
@@ -376,7 +477,9 @@ def player_profile(league, player_id, week):
                              "projected_stats": _clean_breakdown((getattr(box_player, "projected_breakdown", None) if box_player is not None else None) or current.get("projected_breakdown"))},
             "last_completed_game": history[0] if history else None,
             "recent_games": history[:5],
-            "source": "ESPN fantasy player data", "note": "Weekly stat breakdowns reflect the data currently provided by ESPN."}
+            "source": ("ESPN free-agent pool + public NFL stats" if free_agent and not (box_player or roster_player)
+                       else "ESPN fantasy player data"),
+            "note": "Recent fantasy points use historical ESPN Fantasy scores when available, followed by verified nflverse weekly scoring. Public NFL gamelogs never masquerade as fantasy scores."}
 
 
 def clear_live_cache():

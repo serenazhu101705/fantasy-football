@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
-import { Activity, ArrowRight, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, ClipboardList, Clock3, LayoutDashboard, MessageCircle, Newspaper, RefreshCw, Send, X, ShieldCheck, Sparkles, TrendingUp, Trophy, Users, Zap } from 'lucide-react'
+import { Activity, ArrowRight, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, ClipboardList, Clock3, LayoutDashboard, MessageCircle, Newspaper, RefreshCw, Send, X, ShieldCheck, Sparkles, TrendingUp, Trophy, Users, Zap, Mail, Settings2 } from 'lucide-react'
 import { ApiError, post, request } from './api'
 import { orderRoster } from './rosterLayout'
 import type { CoachReply, LeagueData, LineupData, Player, WaiverBrowserData, MatchupStrategy,
-  StandingsData, FaabData, ScheduleData, TransactionData, TeamRosterData, ClaimsData, LeagueMatchupsData, NewsBrowseData, RosterNewsData, MatchupPlayer, PlayerProfile, PlayerAnalysis, StatLine, WeeklyRecap, WeeklyRecapStatus } from './api' 
+  LineupPreview, ApplyLineupResponse, StandingsData, FaabData, ScheduleData, TransactionData, TeamRosterData, ClaimsData, LeagueMatchupsData, NewsBrowseData, RosterNewsData, MatchupPlayer, PlayerProfile, PlayerAnalysis, StatLine, WeeklyRecap, WeeklyRecapStatus } from './api' 
 
-type Tab = 'overview' | 'roster' | 'waivers' | 'lineup' | 'matchup' | 'league' | 'feed'
+type Tab = 'overview' | 'roster' | 'waivers' | 'lineup' | 'matchup' | 'league' | 'feed' | 'settings'
 type Message = { id: number, role: 'user' | 'assistant', text: string, usage?: CoachReply }
 const SUGGESTIONS = [
   'What do I need to do to win this week?',
@@ -167,6 +167,16 @@ export default function App() {
   const [league, setLeague] = useState<LeagueData | null>(null)
   const [roster, setRoster] = useState<Player[]>([])
   const [lineup, setLineup] = useState<LineupData | null>(null)
+  const [lineupPreview,setLineupPreview] = useState<LineupPreview | null>(null)
+  const [lineupActionError,setLineupActionError] = useState('')
+  const [lineupActionMessage,setLineupActionMessage] = useState('')
+  const [lineupActionLoading,setLineupActionLoading] = useState(false)
+  const [email,setEmail] = useState('')
+  const [emailPrefs,setEmailPrefs] = useState({thursday_lineup:true,monday_recap:true,injury_news:true,bye_alerts:true,auto_swap:false})
+  const [emailSending,setEmailSending] = useState(false)
+  const [emailMessage,setEmailMessage] = useState('')
+  const [emailError,setEmailError] = useState('')
+
   const [waivers, setWaivers] = useState<WaiverBrowserData | null>(null)
   const [waiverPage, setWaiverPage] = useState(1)
   const [position, setPosition] = useState('ALL')
@@ -185,6 +195,8 @@ export default function App() {
   const [rosterNews, setRosterNews] = useState<RosterNewsData | null>(null)
   const [rosterNewsError, setRosterNewsError] = useState('')
   const [teamNewsPage, setTeamNewsPage] = useState(1)
+  const [expandedNewsPlayers, setExpandedNewsPlayers] = useState<Record<string, boolean>>({})
+  const [rosterNewsRefresh, setRosterNewsRefresh] = useState(0)
   const [recapWeek, setRecapWeek] = useState<number | null>(null)
   const [recapStatus, setRecapStatus] = useState<WeeklyRecapStatus | null>(null)
   const [recap, setRecap] = useState<WeeklyRecap | null>(null)
@@ -210,6 +222,35 @@ export default function App() {
   const chatCounter = useRef(0)
 
   const openPlayer = useCallback((id:number,name:string)=>setSelectedPlayer({id,name}),[])
+
+  async function loadLineupPreview() {
+    setLineupActionLoading(true);setLineupActionError('');setLineupActionMessage('');setLineupPreview(null)
+    try { setLineupPreview(await request<LineupPreview>('/api/lineup/preview')) }
+    catch(err){setLineupActionError(err instanceof Error?err.message:'ESPN lineup preview unavailable')}
+    finally{setLineupActionLoading(false)}
+  }
+
+  async function confirmLineupApply(){
+    if(!lineupPreview || lineupActionLoading)return
+    setLineupActionLoading(true);setLineupActionError('')
+    try{
+      const outcome=await post<ApplyLineupResponse>('/api/lineup/apply', {confirmation_token:lineupPreview.confirmation_token})
+      setLineupActionMessage(outcome.note)
+      setLineupPreview(null)
+      if(outcome.verified){await loadDashboard()}
+    }catch(err){setLineupActionError(err instanceof Error?err.message:'ESPN lineup update unavailable');setLineupPreview(null)}
+    finally{setLineupActionLoading(false)}
+  }
+
+  async function submitEmail(event:FormEvent){
+    event.preventDefault();setEmailSending(true);setEmailError('');setEmailMessage('')
+    try{
+      const result=await post<{message:string}>('/api/subscriptions',{email,...emailPrefs})
+      setEmailMessage(result.message)
+    }catch(err){setEmailError(err instanceof Error?err.message:'Could not subscribe')}
+    finally{setEmailSending(false)}
+  }
+
 
   const loadDashboard = useCallback(async () => {
     setLoading(true)
@@ -297,11 +338,11 @@ export default function App() {
   useEffect(() => {
     if (tab !== 'feed' || feedTab !== 'team' || rosterNews || !league) return
     let cancelled=false
-    request<RosterNewsData>('/api/news/roster')
+    request<RosterNewsData>(`/api/news/roster${rosterNewsRefresh ? '?refresh=true' : ''}`)
       .then(data=>{if(!cancelled){setRosterNews(data);setRosterNewsError('')}})
       .catch(err=>{if(!cancelled)setRosterNewsError(err instanceof Error?err.message:'Roster news unavailable')})
     return ()=>{cancelled=true}
-  },[tab,feedTab,rosterNews,league])
+  },[tab,feedTab,rosterNews,league,rosterNewsRefresh])
 
   useEffect(() => {
     if (tab !== 'league' || leagueSubTab !== 'activity' || transactions) return
@@ -423,6 +464,7 @@ export default function App() {
         <NavButton active={tab==='matchup'} icon={<Activity size={18}/>} label="Weekly Matchup" onClick={()=>setTab('matchup')}/>
         <NavButton active={tab==='league'} icon={<Users size={18}/>} label="League Explorer" onClick={()=>setTab('league')}/>
         <NavButton active={tab==='feed'} icon={<Newspaper size={18}/>} label="News Feed" onClick={()=>setTab('feed')}/>
+        <NavButton active={tab==='settings'} icon={<Settings2 size={18}/>} label="Email & Automation" onClick={()=>setTab('settings')}/>
       </nav>
       <div className="sidebar-bottom"><div className="sidebar-note"><ShieldCheck size={17}/><span>League data from ESPN<br/>Advice powered by Claude</span></div><div className="account"><span className="avatar">FC</span><span><strong>Personal workspace</strong><small>Local development mode</small></span></div></div>
     </aside>
@@ -432,7 +474,7 @@ export default function App() {
         <div className="top-actions"><span className={`online-dot ${error ? 'offline' : ''}`}/><span className="connection">{error ? 'Check connection' : league ? 'ESPN connected' : 'Connecting to ESPN'}</span><button className="refresh-button" onClick={refresh} disabled={refreshing || sending} title="Reload ESPN fantasy data"><RefreshCw size={16} className={refreshing ? 'rotating' : ''}/><span>Refresh</span></button></div>
       </header>
       <div className="content">
-        <section className="page-intro"><div className="eyebrow"><span className="eyebrow-line"/> DECISIONS, NOT GUESSWORK</div><div className="intro-row"><div><h1>{tab === 'overview' ? 'Your fantasy command center.' : tab === 'roster' ? 'Your roster.' : tab === 'waivers' ? 'The waiver wire.' : tab === 'matchup' ? 'Your path to victory.' : tab === 'league' ? 'Your entire league.' : tab === 'feed' ? 'The fantasy news feed.' : 'Your optimal lineup.'}</h1><p>{tab === 'overview' ? 'Make sharper start/sit calls, uncover waiver value, and know exactly where your team stands.' : tab === 'roster' ? 'Every player, role, and projection in one place.' : tab === 'waivers' ? 'Explore the actual available player pool before making a move.' : tab === 'matchup' ? 'Your ESPN matchup, projection gap, and potential lineup gains.' : tab === 'league' ? 'Records, FAAB, schedules, league moves, and opponent rosters.' : tab === 'feed' ? 'Fresh NFL headlines and fantasy analysis from ESPN and RotoWire.' : 'A deterministic starting point—not a substitute for your judgment.'}</p></div><div className="week-chip"><Activity size={16}/><span>WEEK {league?.week || '—'}</span><span className="chip-divider"/>{league?.scoring?.scoring || '—'}</div></div></section>
+        <section className="page-intro"><div className="eyebrow"><span className="eyebrow-line"/> DECISIONS, NOT GUESSWORK</div><div className="intro-row"><div><h1>{tab === 'overview' ? 'Your fantasy command center.' : tab === 'roster' ? 'Your roster.' : tab === 'waivers' ? 'The waiver wire.' : tab === 'matchup' ? 'Your path to victory.' : tab === 'league' ? 'Your entire league.' : tab === 'feed' ? 'The fantasy news feed.' : tab === 'settings' ? 'Email & automation.' : 'Your optimal lineup.'}</h1><p>{tab === 'overview' ? 'Make sharper start/sit calls, uncover waiver value, and know exactly where your team stands.' : tab === 'roster' ? 'Every player, role, and projection in one place.' : tab === 'waivers' ? 'Explore the actual available player pool before making a move.' : tab === 'matchup' ? 'Your ESPN matchup, projection gap, and potential lineup gains.' : tab === 'league' ? 'Records, FAAB, schedules, league moves, and opponent rosters.' : tab === 'feed' ? 'Fresh NFL headlines and fantasy analysis from ESPN and RotoWire.' : tab === 'settings' ? 'Confirm newsletter preferences and configure opt-in lineup automation.' : 'A deterministic starting point—not a substitute for your judgment.'}</p></div><div className="week-chip"><Activity size={16}/><span>WEEK {league?.week || '—'}</span><span className="chip-divider"/>{league?.scoring?.scoring || '—'}</div></div></section>
 
         {error && <div className="banner-error"><CircleAlert size={18}/><span>{error}</span><button onClick={()=>void loadDashboard()}>Retry</button></div>}
         {loading && <div className="loading-line"><RefreshCw size={15} className="rotating"/> Loading your league data…</div>}
@@ -460,6 +502,18 @@ export default function App() {
         {tab==='roster' && <RosterColumns players={roster} onOpen={openPlayer}/>}
 
         {tab==='waivers' && <section className="panel full-panel"><div className="panel-head"><div><span className="panel-kicker">ESPN FREE AGENT POOL</span><h2>Players available now</h2></div><div className="filter-bar">{POSITION_FILTERS.map(pos=><button key={pos} onClick={()=>{setPosition(pos);setWaiverPage(1)}} className={position===pos ? 'selected' : ''}>{pos}</button>)}</div></div><p className="panel-description">Browse 10 players at a time from the expanded ESPN free-agent pool, not just the five-player Claude shortlist. Select a player to open their profile. No Claude calls are needed.</p><div className="player-list">{(waivers?.candidate_pool || []).map((p,i)=><PlayerRow key={`${p.espn_id||p.name}-${i}`} player={p} onOpen={openPlayer}/>)}{!waivers && <div className="empty">Loading available players…</div>}{waivers && !waivers.candidate_pool.length && <div className="empty">No more players loaded for this filter.</div>}</div>{waivers && <><PageControls page={waivers.page} totalPages={waivers.total_pages} total={waivers.total} label="Waiver" onChange={setWaiverPage}/><p className="panel-description">{waivers.note}</p></>}</section>}
+
+        {tab==='lineup' && <section className="panel full-panel lineup-action-panel">
+          <div className="panel-head"><div><span className="panel-kicker">ESPN ROSTER CONTROL</span><h2>Apply optimal lineup</h2></div><button className="button-action" disabled={lineupActionLoading} onClick={()=>void loadLineupPreview()}>{lineupActionLoading?'Checking ESPN…':'Preview lineup changes'} <ArrowRight size={15}/></button></div>
+          <p className="panel-description">Nothing changes until you review and confirm. ESPN writes are disabled by default in your backend. Kickoffs, player locks and eligibility must all be verified.</p>
+          {lineupActionError && <div className="detail-error">{lineupActionError}</div>}
+          {lineupActionMessage && <div className="automation-success">{lineupActionMessage}</div>}
+          {lineupPreview && <div className="apply-preview"><h3>Week {lineupPreview.week} · {lineupPreview.change_count} changes</h3>
+            {lineupPreview.changes.length ? lineupPreview.changes.map(row=><div key={row.player_id} className="preview-move"><strong>{row.name}</strong><span>{row.from} → {row.to}</span></div>) : <p>Already optimal; no changes needed.</p>}
+            {!lineupPreview.writes_enabled && <p className="detail-muted">ESPN write mode is disabled. Set ESPN_WRITES_ENABLED=1 on the server only after reviewing the safety notes.</p>}
+            <div className="preview-actions"><button className="button-action" disabled={lineupActionLoading || !lineupPreview.writes_enabled} onClick={()=>void confirmLineupApply()}>Confirm and apply on ESPN</button><button className="refresh-button" onClick={()=>setLineupPreview(null)}>Cancel</button></div>
+          </div>}
+        </section>}
 
         {tab==='lineup' && <section className="panel full-panel"><div className="panel-head"><div><span className="panel-kicker">TRANSPARENT OPTIMIZER</span><h2>Optimal lineup, explained</h2></div><span className="count-pill">{points(lineup?.projected_total)} pts</span></div>
           <p className="panel-description">{lineup?.explanation?.method || 'Using the mean of available ESPN and FantasyPros league-scoring projections.'}</p>
@@ -579,7 +633,7 @@ export default function App() {
 
         {tab==='feed' && <section className="panel full-panel league-details">
           <div className="panel-head"><div><span className="panel-kicker">FANTASY FOOTBALL COVERAGE</span><h2>Fantasy News & My Team</h2></div>
-            <button className="refresh-button" onClick={()=>{setNews(null);setNewsPage(1);setTeamNewsPage(1);setNewsError('');setRosterNews(null);setRosterNewsError('')}}><RefreshCw size={15}/> Reload</button></div>
+            <button className="refresh-button" onClick={()=>{setNews(null);setNewsPage(1);setTeamNewsPage(1);setNewsError('');setRosterNews(null);setRosterNewsError('');setExpandedNewsPlayers({});setRosterNewsRefresh(n=>n+1)}}><RefreshCw size={15}/> Refresh coverage</button></div>
           <div className="league-controls">
             <button className={feedTab==='fantasy'?'selected':''} onClick={()=>setFeedTab('fantasy')}>Fantasy articles</button>
             <button className={feedTab==='team'?'selected':''} onClick={()=>setFeedTab('team')}>My Team News</button>
@@ -602,19 +656,20 @@ export default function App() {
             <p className="panel-description">News for each player actually on your ESPN roster. Injury updates take priority when relevant. Roster-player coverage is fetched only when you open this tab and cached.</p>
             {rosterNewsError && <p className="panel-description">{rosterNewsError}</p>}
             {!rosterNews && !rosterNewsError && <p className="panel-description">Checking your roster players and available ESPN stories…</p>}
-            {rosterNews && <p className="panel-description">Recent fantasy coverage found for {rosterNews.matched_players} of {rosterNews.total_players} players. Missing stories are clearly marked.</p>}
+            {rosterNews && <p className="panel-description">Ranked fantasy coverage found for {rosterNews.matched_players} of {rosterNews.total_players} players. The two highest-ranked articles appear first, based on freshness, player relevance and injury context.{rosterNews.refreshed_at && <> Updated {new Date(rosterNews.refreshed_at).toLocaleString()}.</>}</p>}
             <div className="roster-news-list">{rosterNews?.players.slice((teamNewsPage-1)*10, teamNewsPage*10).map(p=><div className="roster-news-player" key={p.name}>
               <div className="roster-news-heading"><strong>{p.name}</strong><span>{p.position || 'Player'}</span>{p.injury_status && p.injury_status!=='ACTIVE' && <span className="injury">{p.injury_status}</span>}
                 {p.espn_id != null && <button className="subtle-link" onClick={()=>openPlayer(p.espn_id!,p.name)}>Stats & profile ↗</button>}</div>
-              {p.articles.length ? p.articles.map(a=><a key={a.url} className="news-card" href={a.url} rel="noopener noreferrer" target="_blank"><div className="news-meta"><span>{a.source}</span><time>{a.published_at?new Date(a.published_at).toLocaleDateString():'Date unavailable'}</time></div><h3>{a.title}</h3>{a.summary && <p>{a.summary}</p>}<small>Read article ↗</small></a>)
-                : <p className="detail-muted">No verified article found in the available feeds. <a href={p.coverage_url} target="_blank" rel="noopener noreferrer">Search latest {p.name} fantasy coverage ↗</a></p>}
-              {p.articles.length>0 && p.coverage_url && <a className="news-more-link" href={p.coverage_url} target="_blank" rel="noopener noreferrer">More {p.name} articles ↗</a>}
+              {p.articles.length ? (expandedNewsPlayers[p.name] ? p.articles : p.articles.slice(0,2)).map(a=><a key={a.url} className="news-card" href={a.url} rel="noopener noreferrer" target="_blank"><div className="news-meta"><span>{a.source}</span><time>{a.published_at?new Date(a.published_at).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'}):'Date unavailable'}</time></div><h3>{a.title}</h3>{a.summary && <p>{a.summary}</p>}<small>Read article ↗</small></a>)
+                : <p className="detail-muted">No verified fantasy article returned for this player. <a href={p.coverage_url} target="_blank" rel="noopener noreferrer">Search current {p.name} coverage ↗</a></p>}
+              {p.articles.length>2 && <button type="button" className="news-expand-button" aria-expanded={!!expandedNewsPlayers[p.name]} onClick={()=>setExpandedNewsPlayers(prev=>({...prev,[p.name]:!prev[p.name]}))}>{expandedNewsPlayers[p.name] ? 'Show top 2 articles' : `View all ${p.articles.length} ranked articles`} <ChevronDown size={15}/></button>}
+              {p.articles.length>0 && p.coverage_url && <a className="news-more-link" href={p.coverage_url} target="_blank" rel="noopener noreferrer">Search additional live coverage ↗</a>}
             </div>)}</div>
             {rosterNews && <PageControls page={teamNewsPage} totalPages={Math.max(1,Math.ceil(rosterNews.players.length/10))} total={rosterNews.players.length} label="My Team News" onChange={setTeamNewsPage}/>}
           </>}
         </section>}
 
-        <section className="chat-panel" aria-label="Fantasy Coach chat"><div className="chat-heading"><div className="coach-avatar"><Bot size={23}/></div><div><div className="coach-label"><h2>Ask Fantasy Coach</h2><span className="available"><span/> Ready to analyze</span></div><p>Personalized strategy, powered by your league data.</p></div><span className="chat-model">CLAUDE · v7.16</span></div>
+        <section className="chat-panel" aria-label="Fantasy Coach chat"><div className="chat-heading"><div className="coach-avatar"><Bot size={23}/></div><div><div className="coach-label"><h2>Ask Fantasy Coach</h2><span className="available"><span/> Ready to analyze</span></div><p>Personalized strategy, powered by your league data.</p></div><span className="chat-model">CLAUDE · v7.21</span></div>
           <div className="chat-body">{messages.length===0 ? <div className="chat-welcome"><div className="chat-welcome-icon"><MessageCircle size={21}/></div><h3>What are we figuring out today?</h3><p>Compare players, explore waivers, or ask for the best move for your roster.</p><div className="suggestions">{SUGGESTIONS.map(s=><button onClick={()=>void send(undefined,s)} key={s} disabled={sending}>{s}<ArrowRight size={13}/></button>)}</div></div> : <div className="messages">{messages.map(message=><div className={`message ${message.role}`} key={message.id}><div className="message-avatar">{message.role === 'assistant' ? <Bot size={17}/> : <span>YOU</span>}</div><div className="message-main"><div className="message-author">{message.role === 'assistant' ? 'Fantasy Coach' : 'You'}</div><RichText text={message.text}/>{message.usage && <span className="usage"><Check size={12}/>{moneyTokens(message.usage)}</span>}</div></div>)}{sending && <div className="typing"><span/><span/><span/> Analyzing league data…</div>}<div ref={chatBottom}/></div>}</div>
           {chatError && <div className="chat-error"><CircleAlert size={15}/>{chatError}</div>}
           <form className="composer" onSubmit={e=>void send(e)}><textarea id="coach-input" rows={2} maxLength={2000} placeholder="Ask about your lineup, trades, waivers, or player value…" value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter' && !e.shiftKey){e.preventDefault();void send()}}} disabled={sending}/><button aria-label="Send message" type="submit" disabled={sending || !input.trim()}>{sending ? <Clock3 size={19}/> : <Send size={19}/>}</button></form><div className="composer-foot"><span><ShieldCheck size={12}/> ESPN-derived scoring · No data guesswork</span><span>ENTER TO SEND <ChevronDown size={12}/> SHIFT+ENTER FOR NEW LINE</span></div>
@@ -622,6 +677,23 @@ export default function App() {
         <footer>FANTASY COACH · LOCAL DEVELOPMENT <span>Built to support better decisions, not guarantee outcomes.</span></footer>
       </div>
     </main>
+    {tab==='settings' && <section className="panel full-panel"><div className="panel-head"><div><span className="panel-kicker">EMAIL SUBSCRIPTION · CONFIRMATION REQUIRED</span><h2>Fantasy Coach weekly updates</h2></div><Mail size={24}/></div>
+      <form className="email-settings" onSubmit={e=>void submitEmail(e)}>
+        <label className="email-field">Email address<input type="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" /></label>
+        {([
+          ['thursday_lineup','Thursday morning optimal lineup and projections'],
+          ['monday_recap','Weekly Claude recap after every NFL game is final'],
+          ['injury_news','Relevant news links for injured players on my team'],
+          ['bye_alerts','Weekly bye-week alerts'],
+          ['auto_swap','Automatically replace OUT / IR / suspended / bye starters on ESPN (advanced)'],
+        ] as const).map(([key,label])=><label className="email-option" key={key}><input type="checkbox" checked={emailPrefs[key]} onChange={e=>setEmailPrefs(prev=>({...prev,[key]:e.target.checked}))}/><span>{label}</span></label>)}
+        <p className="detail-muted">Email delivery requires server SMTP settings and a scheduled job. You must click the confirmation link before any messages are sent. Automatic ESPN lineup swaps also require separate server-level opt-ins and refuse unverifiable or locked players. Claude recaps may incur token charges.</p>
+        <button type="submit" disabled={emailSending} className="button-action">{emailSending?'Sending…':'Subscribe & email me a confirmation'} <Mail size={16}/></button>
+        {emailError && <div className="detail-error">{emailError}</div>}
+        {emailMessage && <div className="automation-success">{emailMessage}</div>}
+      </form>
+    </section>}
+
     {selectedPlayer && <PlayerDrawer selected={selectedPlayer} onClose={()=>setSelectedPlayer(null)} week={league?.week}/>}
   </div>
 }

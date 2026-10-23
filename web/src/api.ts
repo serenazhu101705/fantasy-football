@@ -190,6 +190,8 @@ export interface LeagueMatchupsData {
 
 export interface RosterNewsData {
   status:string
+  refreshed_at?:string
+  ranking_method?:string
   matched_players:number
   total_players:number
   note:string
@@ -283,4 +285,22 @@ export interface WeeklyRecap {
   cached:boolean
   input_tokens:number
   output_tokens:number
+}
+
+// v7.22: explicit email opt-in + guarded ESPN lineup transactions.
+export interface LineupPreview {
+  week: number
+  projected_total: number | null
+  changes: Array<{player_id:number,name:string,from:string,to:string}>
+  change_count:number
+  writes_enabled:boolean
+  confirmation_token:string
+  expires_in_seconds:number
+  note:string
+}
+export interface ApplyLineupResponse {
+  applied:boolean
+  verified:boolean
+  changes:Array<{player_id:number,name:string,from:string,to:string}>
+  note:string
 }

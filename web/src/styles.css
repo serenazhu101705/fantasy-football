@@ -130,3 +130,19 @@
 .game-log-pts.unavailable { color: #aabacb; font-weight: 500; }
 .game-log-expanded { margin-top: .8rem; border-top: 1px solid rgba(156,180,203,.18); padding-top: .75rem; }
 .game-log-expanded .stat-detail-grid { margin-top: .5rem; }
+
+/* v7.21: show the highest-ranked two first; expand the other verified stories. */
+.news-expand-button{display:inline-flex;align-items:center;justify-content:center;gap:7px;justify-self:start;border:1px solid #61816b;background:#243d35;color:#b9f58d;border-radius:9px;padding:9px 12px;cursor:pointer;font-size:12px;font-weight:700;transition:background .15s,border-color .15s}
+.news-expand-button:hover{background:#315340;border-color:#baf67d}
+.news-expand-button[aria-expanded=true] svg{transform:rotate(180deg)}
+
+/* v7.22 – ESPN apply preview and email subscription settings */
+.lineup-action-panel{margin-bottom:18px}.apply-preview{margin:10px 22px 22px;padding:16px;background:#1a2e31;border:1px solid #41655c;border-radius:11px}.apply-preview h3{margin:0 0 12px;font-size:15px}
+.preview-move{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #38505a;padding:8px 0;color:#d8e8ee;font-size:12px}.preview-move span{color:#c0ed9b;font-variant-numeric:tabular-nums}.preview-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:17px}
+.automation-success{padding:12px 15px;margin:12px 22px;background:#1d3d32;color:#c0f5a0;border:1px solid #507959;border-radius:8px;font-size:12px}
+.email-settings{max-width:760px;margin:0 auto;padding:20px 25px 35px;display:grid;gap:13px}
+.email-field{display:grid;gap:8px;font-size:13px;font-weight:700;color:#dae8f0}.email-field input{padding:12px 14px;border-radius:9px;border:1px solid #435768;background:#192936;color:#f0f6fa;font:inherit}
+.email-option{display:flex;gap:12px;align-items:flex-start;padding:13px;background:#1b2a35;border:1px solid #334957;border-radius:9px;font-size:13px;color:#c5d6df;cursor:pointer}
+.email-option input{accent-color:#b8f875;width:17px;height:17px;flex-shrink:0}
+.email-settings .button-action{justify-self:start}.email-settings .detail-error,.email-settings .automation-success{margin:0}
+@media(max-width:700px){.email-settings{padding:15px}.apply-preview{margin:10px}}
