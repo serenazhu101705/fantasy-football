@@ -20,6 +20,11 @@ METRICS = {
     "receptions": ("Receptions", "receptions", "receptions"),
     "targets": ("Targets", "targets", "targets"),
     "completions": ("Pass completions", "completions", "completions"),
+    "carries": ("Rushing attempts", "carries", "attempts"),
+    "passing_interceptions": ("Interceptions thrown", "interceptions", "INT"),
+    "passing_attempts": ("Pass attempts", "attempts", "attempts"),
+    "defensive_sacks": ("Defensive sacks", "def_sacks", "sacks"),
+    "defensive_interceptions": ("Defensive interceptions", "def_interceptions", "INT"),
 }
 
 _CATEGORY_ALIASES = {
@@ -32,11 +37,16 @@ _CATEGORY_ALIASES = {
     "receptions": (r"\breceptions?\b", r"\bcatches\b"),
     "targets": (r"\btargets?\b",),
     "completions": (r"\b(?:pass\s+)?completions?\b",),
+    "carries": (r"\bcarries\b", r"\brushing\s+attempts?\b"),
+    "passing_interceptions": (r"\b(?:passing\s+)?interceptions?\s+thrown\b", r"\binterceptions?\s+thrown\b", r"\bpassing\s+interceptions?\b"),
+    "passing_attempts": (r"\b(?:passing|pass)\s+attempts?\b",),
+    "defensive_sacks": (r"\bsacks?\b",),
+    "defensive_interceptions": (r"\binterceptions?\b",),
 }
 
 _LEADERSHIP = re.compile(
-    r"\b(?:who|which|what)\b.*\b(?:leads?|leading|leader|most|top|highest|best|rank)|"
-    r"\b(?:leading|leaders?|leaderboard|most|top|highest|rankings?)\b", re.I
+    r"\b(?:who|which|what)\b.*\b(?:le+a+d+s?|leading|leader|most|top|highest|best|rank)|"
+    r"\b(?:le+a+d+s?|leading|leaders?|leaderboard|most|top|highest|rankings?)\b", re.I
 )
 
 
@@ -142,7 +152,7 @@ def get_nfl_leaderboard(question: str, *, season: int = 2026) -> dict:
             return {"status": "unavailable", "season": season,
                     "reason": "The loaded nflverse table is missing the requested statistic or identifiers."}
         keep = [col for col in ("season", "week", "player_id", "player_display_name",
-                                "recent_team", parsed["metric"]) if col in columns]
+                                "recent_team", "team", parsed["metric"]) if col in columns]
         # Select just the requested stat instead of serializing full game records.
         rows = df.select(keep).to_dicts()
         return aggregate_leaders(rows, parsed["metric"], season=season, limit=parsed["limit"])
@@ -164,7 +174,9 @@ def format_leaderboard_answer(result: dict) -> str:
     lead = f"**{top['name']}** leads the NFL in {result['stat_label'].lower()} with **{fmt} {result['unit']}**"
     if top.get("team"):
         lead += f" ({top['team']})"
-    lead += f", through available Week {result.get('through_week')} data for {result['season']}."
+    week = result.get("through_week")
+    lead += (f", through available Week {week} data for {result['season']}."
+             if week is not None else f", according to available {result['season']} data.")
     others = []
     for row in leaders[1:]:
         val = row["value"]
@@ -172,5 +184,8 @@ def format_leaderboard_answer(result: dict) -> str:
         others.append(f"{row['rank']}. {row['name']} ({row['team'] or 'team unknown'}): {score}")
     if others:
         lead += "\n\n**Other leaders:**\n" + "\n".join(others)
-    lead += "\n\n*Source: nflverse weekly player statistics. Figures reflect loaded weeks and may lag games in progress.*"
+    source = result.get("source") or "nflverse weekly player statistics"
+    caveat = ("Figures reflect loaded weeks and may lag games in progress." if result.get("through_week") is not None
+              else "ESPN did not specify the latest completed week; totals may be delayed.")
+    lead += f"\n\n*Source: {source}. {caveat}*"
     return lead

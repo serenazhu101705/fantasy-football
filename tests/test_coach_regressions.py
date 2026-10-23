@@ -45,7 +45,7 @@ def load_functions(filename, names, injected=None):
 ROUTER_FUNCTIONS = [
     'normalize_name', 'json_text', '_non_none', '_debug_enabled', '_trace', '_evidence_sources',
     '_has_ros_cue', '_asks_league_scoring', '_is_roster_review',
-    '_is_matchup_strategy_query', '_is_league_data_query', '_is_nfl_leaderboard_query',
+    '_is_matchup_strategy_query', '_is_league_data_query', '_is_nfl_leaderboard_query', '_is_general_nfl_question',
     '_looks_like_waiver_acquisition', '_mentions_open_spot',
     '_is_waiver_replacement_request', '_is_fresh_waiver_request', '_waiver_drop_name', '_intent_for_message',
     '_extract_requested_position', '_extract_requested_add_count',
@@ -113,6 +113,8 @@ class RouterRegressionTests(unittest.TestCase):
             'parse_leaderboard_request': parse_leaderboard_request,
             'get_nfl_leaderboard': lambda question, season=2026: {'status': 'available', 'season': season, 'stat': 'passing_yards', 'stat_label': 'Passing yards', 'unit': 'yds', 'through_week': 7, 'leaders': [{'rank': 1, 'name': 'Sample QB', 'team': 'CIN', 'value': 1750.0}]},
             'format_leaderboard_answer': format_leaderboard_answer,
+            'verified_leaderboard': lambda question, season=2026: {'status': 'available', 'season': season, 'stat': 'rushing_yards' if 'rush' in question else 'passing_yards', 'stat_label': 'Rushing yards' if 'rush' in question else 'Passing yards', 'unit': 'yds', 'through_week': 7, 'leaders': [{'rank': 1, 'name': 'Sample RB' if 'rush' in question else 'Sample QB', 'team': 'CIN', 'value': 1750.0}]},
+            'search_nfl_sources': lambda question, season=2026: {'status': 'available', 'kind': 'news_evidence', 'articles':[{'title':'Test News', 'source':'ESPN', 'url':'https://espn.com/test'}]},
         })
 
     def call(self, name, *args, **kwargs):
