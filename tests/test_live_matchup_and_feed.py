@@ -72,12 +72,12 @@ class NewsTests(unittest.TestCase):
         def athlete(url):
             calls.append(url)
             return json.dumps({'articles':[]}).encode()
-        result=roster_news(roster,feed_fetcher=lambda url:rss,athlete_fetcher=athlete)
+        result=roster_news(roster,feed_fetcher=lambda url:rss,athlete_fetcher=athlete,search_fetcher=lambda _:b'<rss><channel/></rss>')
         self.assertEqual(result['total_players'],2)
         self.assertEqual(result['matched_players'],1)
         self.assertEqual(result['players'][0]['articles'][0]['title'],'A.J. Brown injured at practice')
         self.assertEqual(result['players'][1]['status'],'not_found')
-        self.assertEqual(len(calls),1)
+        self.assertEqual(len(calls),2)  # all providers are checked before ranking
     def test_espn_athlete_fallback_is_attributed(self):
         roster=[{'name':'Jahmyr Gibbs','espn_id':42,'position':'RB'}]
         xml=b'<rss><channel></channel></rss>'
@@ -87,7 +87,7 @@ class NewsTests(unittest.TestCase):
         # This date is in the present conversation's 2026 season, but the
         # test must not depend on simulated wall clock. Omit date for longevity.
         athlete=athlete.replace(b'"published": "2026-10-22T15:00:00Z"',b'"published": null')
-        result=roster_news(roster,feed_fetcher=lambda _:xml,athlete_fetcher=lambda url:athlete)
+        result=roster_news(roster,feed_fetcher=lambda _:xml,athlete_fetcher=lambda url:athlete,search_fetcher=lambda _:b'<rss><channel/></rss>')
         self.assertEqual(result['matched_players'],1)
         self.assertEqual(result['players'][0]['articles'][0]['source'],'ESPN Player News')
 
