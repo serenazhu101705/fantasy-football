@@ -1364,6 +1364,9 @@ def main():
         "roster":
             roster,
 
+        "free_agents":
+            free_agents,
+
         "waiver_candidates":
             waiver_candidates,
 
