@@ -681,7 +681,7 @@ export default function App() {
               <p className="panel-description"><strong>{opponentRoster.name}</strong> · Week {opponentRoster.week} · ESPN lineup slots, with week-specific projections when available. Click any player for stats and analysis.</p>
               <RosterColumns title={`${opponentRoster.name} starters`} onOpen={openPlayer} players={opponentRoster.roster.map(p=>({
                 espn_id:p.espn_id,name:p.name,position:p.position,team:p.nfl_team,
-                lineup_slot:p.slot,opponent:p.opponent,injury_status:p.injury_status,
+                lineup_slot:p.slot,opponent:p.opponent ?? undefined,injury_status:p.injury_status,
                 espn_projection:p.projected_points,
               }))}/>
             </div>}

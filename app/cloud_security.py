@@ -52,6 +52,16 @@ def configure_cloud_app(app: FastAPI, *, static_dir: Path | None = None) -> Fast
                 "Authentication required", status_code=401,
                 headers={"WWW-Authenticate": 'Basic realm="Fantasy Coach"', "Cache-Control": "no-store"},
             )
+        # The Capacitor-v8 patch protects remote /api calls with a mobile key.
+        # An authenticated same-origin browser cannot supply that key, so this
+        # outer Basic-auth middleware attaches it for the inner API guard only.
+        # A client-supplied mobile key is discarded to prevent spoofed values.
+        if path.startswith('/api/') and (mobile_key := os.getenv('FANTASY_MOBILE_ACCESS_KEY', '')):
+            if len(mobile_key) < 32:
+                return PlainTextResponse('Invalid server mobile-access configuration', status_code=503)
+            headers = [(k, v) for k, v in request.scope['headers'] if k.lower() != b'x-fantasy-mobile-key']
+            headers.append((b'x-fantasy-mobile-key', mobile_key.encode('ascii')))
+            request.scope['headers'] = headers
         response: Response = await call_next(request)
         if path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"

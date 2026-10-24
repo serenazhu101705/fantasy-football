@@ -189,10 +189,12 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
     api = FastAPI(title="Fantasy Coach API", version="7.21.0", docs_url="/docs")
     api.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "capacitor://localhost", "http://localhost"],
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Fantasy-Session"],
+        allow_headers=["Content-Type", "X-Fantasy-Session", "X-Fantasy-Mobile-Key"],
     )
+    from mobile_access import install_mobile_access_guard
+    install_mobile_access_guard(api)
     api.state.coach_host = host
 
     @api.get("/api/health")

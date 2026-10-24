@@ -1,0 +1,33 @@
+/* Native iOS styling is scoped to Capacitor only (see .ios-app-shell). */
+.ios-app-shell { min-height: 100vh; min-height: 100dvh; }
+.ios-connect-page { background: radial-gradient(circle at 88% 12%,#1c3a2b,transparent 46%),#0b1018; min-height:100dvh; display:grid; place-items:center; padding: max(34px,env(safe-area-inset-top)) 18px max(32px,env(safe-area-inset-bottom)); }
+.ios-connect-card { width:100%; max-width:480px; border:1px solid #34483c; border-radius:22px; background:#131d25; padding:26px 22px; box-shadow:0 20px 80px #0006; }
+.ios-connect-icon { width:58px; height:58px; border-radius:18px; background:#b4f76a; color:#18210b; display:grid; place-items:center; margin-bottom:22px; }
+.ios-overline { font-size:10px; color:#b4f76a; font-weight:900; letter-spacing:2px; }
+.ios-connect-card h1 { font-size:clamp(25px,6vw,35px); margin:10px 0 10px; }
+.ios-connect-card p { color:#a7b6c4; font-size:13px; line-height:1.65; }
+.ios-connect-card label:not(.ios-dev-checkbox) { display:flex; align-items:center; gap:8px; color:#dbe7ee; font-size:12px; font-weight:750; margin:18px 0 8px; }
+.ios-connect-card input[type=url],.ios-connect-card input[type=password] { display:block; width:100%; background:#0b151e; color:#fff; border:1px solid #445b64; border-radius:10px; padding:15px 12px; font-size:16px; outline-offset:3px; }
+.ios-dev-checkbox { margin:17px 0; display:flex; align-items:center; gap:9px; font-size:12px; color:#b2c5b8; }
+.ios-dev-checkbox input { accent-color:#b4f76a; width:18px; height:18px; }
+.ios-connect-button { display:flex; width:100%; align-items:center; justify-content:center; gap:11px; padding:15px; border:0; border-radius:10px; background:#b4f76a; color:#14210e; font-size:13px; font-weight:850; }
+.ios-disconnect-button { width:100%; background:none; color:#c5d0dc; border:0; padding:14px; font-size:13px; }
+.ios-connect-error,.ios-connect-success { border:1px solid #8c5054; color:#ffd6d6; border-radius:8px; background:#42282d; margin:12px 0; padding:12px; display:flex; gap:9px; font-size:12px; align-items:start; }
+.ios-connect-success { color:#c9f5bb; border-color:#597e4d; background:#233d2c; }
+.ios-connect-disclaimer { border-top:1px solid #344151; padding-top:16px; margin-top:23px; font-size:11px !important; }
+.ios-server-settings { position:fixed; right:12px; top:calc(8px + env(safe-area-inset-top)); z-index:201; width:38px; height:38px; border-radius:10px; border:1px solid #3d5847; background:#1f3227; color:#c7f69e; display:grid; place-items:center; }
+.ios-disconnect { position:fixed; bottom:calc(12px + env(safe-area-inset-bottom)); right:16px; z-index:201; border:1px solid #86565b; border-radius:9px; background:#39262b; color:#ffd1d1; padding:12px; font-size:12px; }
+@media (max-width:750px) {
+  .ios-app-shell .sidebar { position:fixed; top:auto; bottom:0; left:0; right:0; width:100%; min-height:0; padding:6px 8px max(6px,env(safe-area-inset-bottom)); border-bottom:0; border-top:1px solid #344638; background:#101722ee; z-index:100; backdrop-filter:blur(16px); }
+  .ios-app-shell .sidebar .brand { display:none; }
+  .ios-app-shell .sidebar nav { width:100%; display:flex; flex-wrap:nowrap; overflow-x:auto; gap:3px; scrollbar-width:none; -webkit-overflow-scrolling:touch; }
+  .ios-app-shell .sidebar nav::-webkit-scrollbar { display:none; }
+  .ios-app-shell .nav-button { min-width:86px; min-height:57px; flex-direction:column; align-items:center; justify-content:center; font-size:10px; font-weight:700; padding:8px 6px; gap:5px; }
+  .ios-app-shell .nav-button svg { width:19px; height:19px; }
+  .ios-app-shell .main { padding-bottom:calc(86px + env(safe-area-inset-bottom)); min-height:100dvh; }
+  .ios-app-shell .topbar { height:calc(55px + env(safe-area-inset-top)); padding-top:env(safe-area-inset-top); padding-right:60px; }
+  .ios-app-shell .content { padding:21px 12px; }
+  .ios-app-shell button { touch-action:manipulation; }
+  .ios-app-shell .player-row { min-width:0; }
+  .ios-app-shell .panel { max-width:100%; }
+}

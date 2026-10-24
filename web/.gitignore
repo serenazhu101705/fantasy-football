@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+.env.*
+.DS_Store
+# Commit the generated ios/ project after Xcode setup if desired; this
+# starter patch generates it on the developer Mac.

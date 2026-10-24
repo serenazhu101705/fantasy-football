@@ -1,3 +1,4 @@
+import { apiURL, apiAuthHeaders } from './mobileConnection'
 export interface Player {
   espn_id?: number | null
   name: string
@@ -113,9 +114,9 @@ export class ApiError extends Error {
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   let response: Response
   try {
-    response = await fetch(path, { ...options, headers: { 'Accept': 'application/json', ...(options.headers || {}) } })
+    response = await fetch(apiURL(path), { ...options, headers: { 'Accept': 'application/json', ...apiAuthHeaders(), ...(options.headers || {}) } })
   } catch {
-    throw new ApiError(0, 'Cannot reach Fantasy Coach API. Start the Python backend on port 8000.')
+    throw new ApiError(0, 'Cannot reach Fantasy Coach API. Check the iPhone connection settings, or start the Python backend.')
   }
   const body = await response.json().catch(() => ({})) as Record<string, unknown>
   if (!response.ok) {
