@@ -17,8 +17,8 @@ def main():
         raise SystemExit('Set FANTASY_WEB_USERNAME and strong FANTASY_WEB_PASSWORD (18+ characters).')
 
     # A private owner-only site. Keep ESPN writes and local digest scheduler off.
-    os.environ['ESPN_WRITES_ENABLED'] = '0'
-    os.environ['ESPN_AUTO_SWAPS_ENABLED'] = '0'
+    os.environ.setdefault('ESPN_WRITES_ENABLED', '0')
+    os.environ.setdefault('ESPN_WRITES_ENABLED', '0')
     os.environ['FANTASY_EMAIL_SCHEDULER_ENABLED'] = '0'
     os.environ.setdefault('FANTASY_SUBSCRIPTIONS_DB', '/tmp/fantasy_coach_subscriptions.sqlite3')
     sys.path.insert(0, str(Path(__file__).resolve().parent / 'app'))
