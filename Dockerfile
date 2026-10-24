@@ -10,6 +10,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy
 WORKDIR /app
+
+# Required for Python dependencies installed directly from GitHub
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN python -m pip install --no-cache-dir uv
 COPY . /app
 RUN uv sync --frozen --no-dev
