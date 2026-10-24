@@ -17,16 +17,22 @@ API = "https://api.github.com"
 NAME = "fantasy-coach-email-state"
 
 
+
 def github_get(url: str) -> bytes:
     token = os.environ["GH_TOKEN"].strip()
     if not token:
         raise RuntimeError("GH_TOKEN was not configured")
+
     req = Request(url, headers={
-        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "fantasy-coach-email-state",
     })
+
+    # Authenticate with GitHub, but don't forward the token
+    # when GitHub redirects to the artifact storage server.
+    req.add_unredirected_header("Authorization", f"Bearer {token}")
+
     with urlopen(req, timeout=25) as res:
         return res.read()
 
