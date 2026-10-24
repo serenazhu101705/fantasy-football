@@ -9,6 +9,7 @@ import type { CoachReply, LeagueData, LineupData, Player, WaiverBrowserData, Wai
 
 type Tab = 'overview' | 'roster' | 'waivers' | 'lineup' | 'matchup' | 'league' | 'feed' | 'settings'
 type Message = { id: number, role: 'user' | 'assistant', text: string, usage?: CoachReply }
+type AutoSwapStatus = { enabled: boolean, configurable: boolean, note: string }
 const SUGGESTIONS = [
   'What do I need to do to win this week?',
   'Am I favored and by how much?',
@@ -194,6 +195,10 @@ export default function App() {
   const [roster, setRoster] = useState<Player[]>([])
   const [lineup, setLineup] = useState<LineupData | null>(null)
   const [lineupPreview,setLineupPreview] = useState<LineupPreview | null>(null)
+  const [autoSwapStatus,setAutoSwapStatus] = useState<AutoSwapStatus | null>(null)
+  const [autoSwapBusy,setAutoSwapBusy] = useState(false)
+  const [autoSwapLoading,setAutoSwapLoading] = useState(false)
+  const [autoSwapError,setAutoSwapError] = useState('')
   const [lineupActionError,setLineupActionError] = useState('')
   const [lineupActionMessage,setLineupActionMessage] = useState('')
   const [lineupActionLoading,setLineupActionLoading] = useState(false)
@@ -268,6 +273,39 @@ export default function App() {
       if(outcome.verified){await loadDashboard()}
     }catch(err){setLineupActionError(err instanceof Error?err.message:'ESPN lineup update unavailable');setLineupPreview(null)}
     finally{setLineupActionLoading(false)}
+  }
+
+  // A server-backed switch: no optimistic change, no ephemeral localStorage.
+  useEffect(() => {
+    if (tab !== 'lineup') return
+    let cancelled = false
+    setAutoSwapLoading(true)
+    setAutoSwapError('')
+    request<AutoSwapStatus>('/api/automation/auto-swap')
+      .then(status => { if (!cancelled) setAutoSwapStatus(status) })
+      .catch(err => { if (!cancelled) { setAutoSwapStatus(null); setAutoSwapError(err instanceof Error ? err.message : 'Could not read Auto Swap setting') } })
+      .finally(() => { if (!cancelled) setAutoSwapLoading(false) })
+    return () => { cancelled = true }
+  }, [tab])
+
+  async function changeAutoSwap() {
+    if (!autoSwapStatus?.configurable || autoSwapBusy) return
+    const next = !autoSwapStatus.enabled
+    if (next && !window.confirm('Enable automatic ESPN lineup changes? GitHub Actions may replace OUT, IR, suspended or bye-week starters before kickoff, without asking again. Healthy starters, waivers and locked players are not meant to change.')) return
+    setAutoSwapBusy(true)
+    setAutoSwapError('')
+    try {
+      const status = await request<AutoSwapStatus>('/api/automation/auto-swap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Fantasy-Automation': 'owner' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      setAutoSwapStatus(status)
+    } catch (err) {
+      setAutoSwapError(err instanceof Error ? err.message : 'Could not update Auto Swap; setting unchanged')
+    } finally {
+      setAutoSwapBusy(false)
+    }
   }
 
   async function submitEmail(event:FormEvent){
@@ -573,6 +611,29 @@ export default function App() {
           </div>}
         </section>}
 
+        {tab==='lineup' && <section className="panel full-panel autoswap-section" aria-label="Automatic lineup substitutions">
+          <div className="autoswap-control">
+            <div className="autoswap-copy">
+              <span className="panel-kicker">AUTOMATION · OWNER ONLY</span>
+              <h2>Auto Swap</h2>
+              <p>Automatically replace verified OUT, IR, suspended or bye-week starters with eligible bench players before kickoff.</p>
+            </div>
+            <button type="button" role="switch" aria-label="Auto Swap" aria-checked={autoSwapStatus?.enabled ?? false}
+              className={`autoswap-switch ${autoSwapStatus?.enabled ? 'is-on' : ''}`}
+              disabled={autoSwapLoading || autoSwapBusy || !autoSwapStatus?.configurable}
+              onClick={()=>void changeAutoSwap()}>
+              <span className="autoswap-knob"/>
+            </button>
+          </div>
+          <div className="autoswap-foot">
+            <span className={`autoswap-indicator ${autoSwapStatus?.enabled ? 'enabled' : ''}`}>
+              {autoSwapBusy ? 'Saving…' : autoSwapLoading ? 'Checking…' : autoSwapStatus?.enabled ? 'ON · Scheduled ESPN changes authorized' : 'OFF · No scheduled auto-swaps authorized'}
+            </span>
+            <p>{autoSwapStatus?.note || 'Auto Swap status is unavailable.'} Checks run on the existing GitHub schedule, not continuously. Turning OFF prevents future checks, but cannot undo an ESPN change already made.</p>
+            {autoSwapError && <p className="detail-error" role="alert">{autoSwapError}</p>}
+          </div>
+        </section>}
+
         {tab==='lineup' && <section className="panel full-panel"><div className="panel-head"><div><span className="panel-kicker">TRANSPARENT OPTIMIZER</span><h2>Optimal lineup, explained</h2></div><span className="count-pill">{points(lineup?.projected_total)} pts</span></div>
           <p className="panel-description">{lineup?.explanation?.method || 'Using the mean of available ESPN and FantasyPros league-scoring projections.'}</p>
           <p className="panel-description"><strong>Projection coverage:</strong> {lineup?.projection_coverage || 'Unknown'} starters have at least one actual provider projection. Missing an ECR ranking is not the same as missing a projection.</p>
@@ -743,7 +804,6 @@ export default function App() {
           ['monday_recap','Weekly Claude recap after every NFL game is final'],
           ['injury_news','Relevant news links for injured players on my team'],
           ['bye_alerts','Weekly bye-week alerts'],
-          ['auto_swap','Automatically replace OUT / IR / suspended / bye starters on ESPN (advanced)'],
         ] as const).map(([key,label])=><label className="email-option" key={key}><input type="checkbox" checked={emailPrefs[key]} onChange={e=>setEmailPrefs(prev=>({...prev,[key]:e.target.checked}))}/><span>{label}</span></label>)}
         <p className="detail-muted">Email delivery requires server SMTP settings and a scheduled job. You must click the confirmation link before any messages are sent. Automatic ESPN lineup swaps also require separate server-level opt-ins and refuse unverifiable or locked players. Claude recaps may incur token charges.</p>
         <button type="submit" disabled={emailSending} className="button-action">{emailSending?'Sending…':'Subscribe & email me a confirmation'} <Mail size={16}/></button>

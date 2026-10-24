@@ -126,8 +126,10 @@ def run_due(*, now=None, engine=None, transport=None):
     # ESPN_WRITES_ENABLED and ESPN_AUTO_SWAPS_ENABLED in server configuration.
     owner_email = os.getenv("FANTASY_OWNER_EMAIL", "").strip().lower()
     authorized_auto = [u for u in interested["auto_swap"] if owner_email and u["email"] == owner_email]
-    if (authorized_auto and os.getenv("ESPN_WRITES_ENABLED") == "1"
-            and os.getenv("ESPN_AUTO_SWAPS_ENABLED") == "1"):
+    # The Actions variable is checked twice, including right before the
+    # transaction. An unavailable GitHub API fails closed (no ESPN write).
+    from auto_swap_control import worker_is_enabled
+    if authorized_auto and worker_is_enabled():
         try:
             from lineup_actions import automatic_injury_bye_lineup, create_preview, submit_preview
             from matchup_live import nfl_game_statuses
@@ -135,7 +137,7 @@ def run_due(*, now=None, engine=None, transport=None):
             restricted = automatic_injury_bye_lineup(team, optimal)
             status = nfl_game_statuses(league, week)
             preview = create_preview(league, team, restricted, game_status=status)
-            if preview["changes"]:
+            if preview["changes"] and worker_is_enabled():
                 response = submit_preview(league, team, restricted, preview["confirmation_token"], game_status=status)
                 for user in authorized_auto:
                     send(user,"auto_swap",f"{year}-{week}-{hashlib.sha256(str(response['changes']).encode()).hexdigest()[:12]}",

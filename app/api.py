@@ -43,6 +43,10 @@ class SubscriptionRequest(BaseModel):
     auto_swap: bool = False
 
 
+class AutoSwapToggleRequest(BaseModel):
+    enabled: bool
+
+
 class ConfirmLineupRequest(BaseModel):
     confirmation_token: str = Field(min_length=16, max_length=256)
 
@@ -191,7 +195,7 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "capacitor://localhost", "http://localhost"],
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Fantasy-Session", "X-Fantasy-Mobile-Key"],
+        allow_headers=["Content-Type", "X-Fantasy-Session", "X-Fantasy-Mobile-Key", "X-Fantasy-Automation"],
     )
     from mobile_access import install_mobile_access_guard
     install_mobile_access_guard(api)
@@ -204,6 +208,32 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         return {"status": "ok", "ready": bool(host.engine and host.engine.APP_CONTEXT is not None),
                 "server_time": datetime.now(timezone.utc).isoformat(),
                 "nfl_leaderboard_guard": GUARD_VERSION}
+
+    # Owner-only Auto Swap switch. Cloud password middleware authenticates
+    # requests. The custom header prevents cross-site form submissions.
+    @api.get("/api/automation/auto-swap")
+    def get_autoswap_setting():
+        from auto_swap_control import AutoSwapControlError, website_status
+        try:
+            return website_status()
+        except AutoSwapControlError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
+
+    @api.post("/api/automation/auto-swap")
+    def set_autoswap_setting(body: AutoSwapToggleRequest, request: Request):
+        from urllib.parse import urlsplit
+        from auto_swap_control import AutoSwapControlError, website_set
+        if request.headers.get("X-Fantasy-Automation") != "owner":
+            raise HTTPException(status_code=403, detail="Missing owner confirmation header.")
+        origin = request.headers.get("origin", "")
+        if origin:
+            parts = urlsplit(origin)
+            if parts.scheme not in ("http", "https") or parts.netloc.lower() != request.headers.get("host", "").lower():
+                raise HTTPException(status_code=403, detail="Cross-site automation changes are not allowed.")
+        try:
+            return website_set(body.enabled)
+        except AutoSwapControlError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
 
     @api.post("/api/sessions", status_code=201)
     def create_session():

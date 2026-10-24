@@ -17,8 +17,12 @@ def ensure_owner_subscription() -> str:
         raise RuntimeError("Personal runner mode must be explicitly enabled.")
     if os.getenv("FANTASY_REPOSITORY_PRIVATE", "").lower() != "true":
         raise RuntimeError("Personal subscriber records require a private GitHub repository.")
-    if os.getenv("ESPN_WRITES_ENABLED") == "1" or os.getenv("ESPN_AUTO_SWAPS_ENABLED") == "1":
-        raise RuntimeError("Automatic ESPN writes must be disabled for the email-only runner.")
+    enabled = os.getenv("FANTASY_AUTO_SWAP_ENABLED", "0")
+    if enabled not in ("0", "1"):
+        raise RuntimeError("Auto Swap requires an explicit 0/1 setting.")
+    if (os.getenv("ESPN_WRITES_ENABLED", "0") != enabled or
+            os.getenv("ESPN_AUTO_SWAPS_ENABLED", "0") != enabled):
+        raise RuntimeError("Auto Swap and ESPN write safety flags must agree.")
     email = _valid_email(os.environ["FANTASY_OWNER_EMAIL"])
     now = datetime.now(timezone.utc)
     with _db() as db:
@@ -30,16 +34,19 @@ def ensure_owner_subscription() -> str:
             # Never overwrite the persisted preferences of an existing subscriber.
             if not existing["confirmed"]:
                 raise RuntimeError("Restored owner subscription is unconfirmed; check database state.")
+            # Always honor the current owner switch, including turning it OFF.
+            db.execute("UPDATE subscribers SET auto_swap=? WHERE email=?",
+                       (int(enabled), email))
             return "existing"
         db.execute("""INSERT INTO subscribers
             (email, confirmed, confirm_hash, confirm_expiry, unsubscribe_hash,
              thursday_lineup, monday_recap, injury_news, bye_alerts, auto_swap, created_at)
-            VALUES (?,1,?,?,?,1,1,1,1,0,?)""",
+            VALUES (?,1,?,?,?,1,1,1,1,?,?)""",
             (email, "", (now + timedelta(days=365)).isoformat(),
-             _token_hash(secrets.token_urlsafe(30)), now.isoformat()))
+             _token_hash(secrets.token_urlsafe(30)), int(enabled), now.isoformat()))
     return "initialized"
 
 
 if __name__ == "__main__":
     status = ensure_owner_subscription()
-    print(f"Personal Fantasy Coach email state: {status}. No automatic ESPN writes enabled.")
+    print(f"Personal Fantasy Coach email state: {status}. Owner Auto Swap preference synced.")

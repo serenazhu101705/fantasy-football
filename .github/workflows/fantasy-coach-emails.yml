@@ -34,8 +34,11 @@ jobs:
       FANTASY_EMAIL_TRANSPORT: resend
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       RESEND_FROM_EMAIL: 'Fantasy Coach <onboarding@resend.dev>'
-      ESPN_WRITES_ENABLED: '0'
-      ESPN_AUTO_SWAPS_ENABLED: '0'
+      # A single durable Actions repository variable is the owner switch.
+      # Default to zero even if the variable was never created.
+      FANTASY_AUTO_SWAP_ENABLED: ${{ vars.FANTASY_AUTO_SWAP_ENABLED == '1' && '1' || '0' }}
+      ESPN_WRITES_ENABLED: ${{ vars.FANTASY_AUTO_SWAP_ENABLED == '1' && '1' || '0' }}
+      ESPN_AUTO_SWAPS_ENABLED: ${{ vars.FANTASY_AUTO_SWAP_ENABLED == '1' && '1' || '0' }}
       FANTASY_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +60,7 @@ jobs:
         run: uv run --frozen python app/github_email_bootstrap.py
       - name: Send due digest emails
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           HOME: ${{ github.workspace }}/data/cloud_home
         run: uv run --frozen python app/run_digest_jobs.py
       - name: Save email delivery state for next run
