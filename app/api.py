@@ -492,7 +492,7 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"Player profile unavailable ({type(exc).__name__}).") from None
         try:
-            return summarize_player(profile, client, model)
+            return summarize_player(profile, client, model, league=league)
         except Exception as exc:
             # Minimal operational diagnostics: no prompts, keys, headers or
             # private roster data in logs or HTTP responses.

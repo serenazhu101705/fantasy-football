@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/Users/serenazhu/fantasy_football/app/run_digest_jobs.py", line 16, in <module>
+    from email_subscriptions import confirmed_subscribers, send_digest
+  File "/Users/serenazhu/fantasy_football/app/email_subscriptions.py", line 13, in <module>
+    import bleach
+ModuleNotFoundError: No module named 'bleach'
+Traceback (most recent call last):
+  File "/Users/serenazhu/fantasy_football/app/run_digest_jobs.py", line 16, in <module>
+    from email_subscriptions import confirmed_subscribers, send_digest
+  File "/Users/serenazhu/fantasy_football/app/email_subscriptions.py", line 13, in <module>
+    import bleach
+ModuleNotFoundError: No module named 'bleach'
