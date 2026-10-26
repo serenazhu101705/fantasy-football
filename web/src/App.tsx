@@ -137,6 +137,9 @@ function PlayerDrawer({ selected, onClose, week }: {selected:{id:number,name:str
     request<PlayerProfile>(`/api/players/${selected.id}${week ? `?week=${week}` : ''}`)
       .then(data=>{if(!cancelled)setProfile(data)})
       .catch(err=>{if(!cancelled)setError(err instanceof Error?err.message:'Player data unavailable')})
+    request<{exists:boolean,report:PlayerAnalysis|null,week:number}>(`/api/players/${selected.id}/analysis`)
+      .then(state=>{if(!cancelled && state.exists && state.report)setAnalysis(state.report)})
+      .catch(err=>{if(!cancelled)setAnalysisError(err instanceof Error?err.message:'Saved report unavailable')})
     return ()=>{cancelled=true}
   },[selected.id,week])
   useEffect(()=>{
@@ -177,7 +180,7 @@ function PlayerDrawer({ selected, onClose, week }: {selected:{id:number,name:str
         <div className="claude-player-card"><div><span className="panel-kicker">OPTIONAL · USES CLAUDE TOKENS</span><h3>Personalized player breakdown</h3><p>A short explanation of the last game, season performance, and this week's outlook, using ESPN facts.</p></div>
           {!analysis && <button className="button-action" disabled={analyzing} onClick={()=>void generate()}>{analyzing?'Analyzing…':'Analyze with Claude'} <Sparkles size={14}/></button>}
           {analysisError && <p className="detail-error">{analysisError}</p>}
-          {analysis && <><RichText text={analysis.analysis}/><span className="analysis-usage">{analysis.cached?'Cached · no new API charge':`${(analysis.input_tokens+analysis.output_tokens).toLocaleString()} tokens · 1 Claude call`}</span></>}
+          {analysis && <><RichText text={analysis.analysis}/><span className="analysis-usage">{analysis.cached?'Saved Week analysis · no new Claude charge':`${(analysis.input_tokens+analysis.output_tokens).toLocaleString()} tokens · 1 Claude call · saved until next fantasy week`}</span></>}
         </div>
         <p className="detail-muted">{profile.note} Only available ESPN data is shown; missing stats are not treated as zero.</p>
       </div>}

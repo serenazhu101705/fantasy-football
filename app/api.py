@@ -473,6 +473,22 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
                 print(f"[PLAYER PROFILE] error={type(exc).__name__}")
             raise HTTPException(status_code=503, detail=f"Player profile unavailable ({type(exc).__name__}).") from None
 
+    @api.get("/api/players/{player_id}/analysis")
+    def get_saved_player_analysis(player_id: int):
+        """Read-only: never spends tokens or generates an analysis."""
+        from weekly_analysis_cache import get_report
+        with host.lock:
+            engine = host.ensure_ready()
+            league, _ = _espn_context(engine)
+            current_week = int(engine.APP_CONTEXT.get('current_week') or getattr(league, 'current_week', 1))
+            season = int(getattr(league, 'year', 2026))
+            league_id = str(getattr(league, 'league_id', 'default'))
+        try:
+            cached = get_report(season, current_week, player_id, league_id)
+            return {'exists': cached is not None, 'report': cached, 'week': current_week}
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f'Saved analysis unavailable ({type(exc).__name__}).') from None
+
     @api.post("/api/players/{player_id}/analysis")
     def generate_player_analysis(player_id: int, week: int | None = Query(default=None, ge=1, le=18)):
         """The *only* player-detail endpoint that spends Claude tokens."""
@@ -492,7 +508,17 @@ def create_app(engine_loader: Callable | None = None) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"Player profile unavailable ({type(exc).__name__}).") from None
         try:
-            return summarize_player(profile, client, model, league=league)
+            from weekly_analysis_cache import get_report, save_report
+            current_week = int(engine.APP_CONTEXT.get('current_week') or getattr(league, 'current_week', 1))
+            season = int(getattr(league, 'year', 2026))
+            league_id = str(getattr(league, 'league_id', 'default'))
+            # Never spend Claude tokens if a player already has a report this week.
+            cached = get_report(season, current_week, player_id, league_id)
+            if cached is not None:
+                return cached
+            result = summarize_player(profile, client, model, league=league)
+            save_report(season, current_week, player_id, result, league_id)
+            return result
         except Exception as exc:
             # Minimal operational diagnostics: no prompts, keys, headers or
             # private roster data in logs or HTTP responses.
