@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.15.0",
+    "bleach>=6.4.0",
     "espn-api>=1.0.0",
     "fastapi>=0.143.0",
     "lxml>=6.1.3",
