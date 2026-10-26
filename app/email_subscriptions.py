@@ -9,6 +9,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from email.message import EmailMessage
+from html import escape
+import bleach
+import markdown
 import hashlib
 import json
 import os
@@ -69,6 +72,39 @@ def _valid_email(email):
     return email
 
 
+def _html_email(body: str) -> str:
+    """Render trusted email layout with sanitized Markdown content.
+
+    Never embed raw model-generated HTML or email content unsanitized.
+    """
+    rendered = markdown.markdown(
+        body,
+        extensions=["extra", "sane_lists", "nl2br"],
+        output_format="html",
+    )
+    allowed_tags = {
+        "p", "br", "strong", "b", "em", "i", "h1", "h2", "h3", "h4",
+        "ul", "ol", "li", "blockquote", "a", "code", "pre",
+        "hr", "table", "thead", "tbody", "tr", "th", "td",
+    }
+    safe = bleach.clean(
+        rendered,
+        tags=allowed_tags,
+        attributes={"a": ["href", "title"]},
+        protocols=["http", "https", "mailto"],
+        strip=True,
+    )
+    safe = bleach.linkify(safe, parse_email=False)
+    return ("<!doctype html><html><head><meta charset=\"utf-8\"></head>"
+            "<body style=\"margin:0;padding:24px;background:#f3f5f8;\">"
+            "<div style=\"max-width:640px;margin:0 auto;padding:28px;"
+            "background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;"
+            "font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;"
+            "font-size:15px;line-height:1.65;color:#17212b;\">"
+            "<div style=\"font-size:20px;font-weight:700;margin-bottom:18px;\">"
+            "Fantasy Coach</div>" + safe + "</div></body></html>")
+
+
 def _send_resend_https(to, subject, body):
     """Send an email over HTTPS (Railway Free blocks outbound SMTP).
 
@@ -79,7 +115,7 @@ def _send_resend_https(to, subject, body):
     sender = os.getenv("RESEND_FROM_EMAIL", "").strip() or os.getenv("SMTP_FROM", "").strip()
     if not api_key or not sender:
         raise RuntimeError("Configure RESEND_API_KEY and RESEND_FROM_EMAIL to send through Resend HTTPS.")
-    payload = json.dumps({"from": sender, "to": [to], "subject": subject, "text": body}).encode("utf-8")
+    payload = json.dumps({"from": sender, "to": [to], "subject": subject, "text": body, "html": _html_email(body)}).encode("utf-8")
     request = Request(
         "https://api.resend.com/emails",
         data=payload,
@@ -121,6 +157,7 @@ def send_email(to, subject, body, *, transport=None):
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(body)
+    msg.add_alternative(_html_email(body), subtype="html")
     port = int(os.getenv("SMTP_PORT", "465"))
     user, password = os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD")
     if port == 465:
