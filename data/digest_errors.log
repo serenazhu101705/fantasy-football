@@ -10,3 +10,96 @@ Traceback (most recent call last):
   File "/Users/serenazhu/fantasy_football/app/email_subscriptions.py", line 13, in <module>
     import bleach
 ModuleNotFoundError: No module named 'bleach'
+Traceback (most recent call last):
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/connection.py", line 204, in _new_conn
+    sock = connection.create_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/util/connection.py", line 60, in create_connection
+    for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/.local/share/uv/python/cpython-3.12.14-macos-x86_64-none/lib/python3.12/socket.py", line 978, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/connectionpool.py", line 788, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/connectionpool.py", line 488, in _make_request
+    raise new_e
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/connectionpool.py", line 464, in _make_request
+    self._validate_conn(conn)
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/connectionpool.py", line 1106, in _validate_conn
+    conn.connect()
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/connection.py", line 759, in connect
+    self.sock = sock = self._new_conn()
+                       ^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/connection.py", line 211, in _new_conn
+    raise NameResolutionError(self.host, self, e) from e
+urllib3.exceptions.NameResolutionError: HTTPSConnection(host='lm-api-reads.fantasy.espn.com', port=443): Failed to resolve 'lm-api-reads.fantasy.espn.com' ([Errno 8] nodename nor servname provided, or not known)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/requests/adapters.py", line 696, in send
+    resp = conn.urlopen(
+           ^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/connectionpool.py", line 842, in urlopen
+    retries = retries.increment(
+              ^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/urllib3/util/retry.py", line 543, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='lm-api-reads.fantasy.espn.com', port=443): Max retries exceeded with url: /apis/v3/games/ffl/seasons/2026/segments/0/leagues/1219686980?view=mTeam&view=mRoster&view=mMatchup&view=mSettings&view=mStandings (Caused by NameResolutionError("HTTPSConnection(host='lm-api-reads.fantasy.espn.com', port=443): Failed to resolve 'lm-api-reads.fantasy.espn.com' ([Errno 8] nodename nor servname provided, or not known)"))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/serenazhu/fantasy_football/app/run_digest_jobs.py", line 153, in <module>
+    result = run_due()
+             ^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/app/run_digest_jobs.py", line 43, in run_due
+    engine.load_app_context()
+  File "/Users/serenazhu/fantasy_football/app/llm.py", line 3304, in load_app_context
+    APP_CONTEXT = build_fantasy_context()
+                  ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/app/main.py", line 1058, in main
+    league = get_league()
+             ^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/app/espn_client.py", line 15, in get_league
+    return League(
+           ^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/espn_api/football/league.py", line 50, in __init__
+    self.fetch_league()
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/espn_api/football/league.py", line 53, in fetch_league
+    self._fetch_league()
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/espn_api/football/league.py", line 56, in _fetch_league
+    data = super()._fetch_league(SettingsClass=Settings)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/espn_api/base_league.py", line 54, in _fetch_league
+    data = self.espn_request.get_league()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/espn_api/requests/espn_requests.py", line 153, in get_league
+    data = self.league_get(params=params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/espn_api/requests/espn_requests.py", line 108, in league_get
+    r = requests.get(endpoint, params=params, headers=headers, cookies=self.cookies)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/requests/api.py", line 87, in get
+    return request("get", url, params=params, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/requests/api.py", line 71, in request
+    return session.request(method=method, url=url, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/requests/sessions.py", line 651, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/requests/sessions.py", line 784, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/serenazhu/fantasy_football/.venv/lib/python3.12/site-packages/requests/adapters.py", line 729, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPSConnectionPool(host='lm-api-reads.fantasy.espn.com', port=443): Max retries exceeded with url: /apis/v3/games/ffl/seasons/2026/segments/0/leagues/1219686980?view=mTeam&view=mRoster&view=mMatchup&view=mSettings&view=mStandings (Caused by NameResolutionError("HTTPSConnection(host='lm-api-reads.fantasy.espn.com', port=443): Failed to resolve 'lm-api-reads.fantasy.espn.com' ([Errno 8] nodename nor servname provided, or not known)"))
